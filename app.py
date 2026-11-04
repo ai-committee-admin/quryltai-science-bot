@@ -1,4 +1,6 @@
 """Ғылым: Telegram intake bot. Text and document analysis."""
+import base64
+import uuid
 import hashlib
 import hmac
 import json
@@ -12,8 +14,11 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from documents import extract_document, MAX_BYTES
+from registry_export import build_registry
 
 MENU = {'keyboard': [['Подать предложение', 'Мои предложения'], ['О совете', 'Мой ID']], 'resize_keyboard': True}
+ADMIN_MENU = {'keyboard': [['Новые заявки', 'Все заявки'], ['Сводка', 'Выгрузить Excel'], ['Подать предложение', 'Мои предложения'], ['О совете', 'Мой ID']], 'resize_keyboard': True}
+ADMIN_ACTIONS = {'Новые заявки': '/inbox', 'Все заявки': '/list', 'Сводка': '/summary', 'Выгрузить Excel': '/export'}
 STATUSES = {'new': 'Получено', 'review': 'На рассмотрении', 'done': 'Рассмотрено'}
 
 
@@ -66,7 +71,7 @@ def say(db, user, text, menu=False):
     for i in range(0, len(text), 1800):
         payload = {'chat_id': user, 'text': text[i:i + 1800]}
         if menu:
-            payload['reply_markup'] = MENU
+            payload['reply_markup'] = menu if isinstance(menu, dict) else MENU
         queue(db, 'sendMessage', payload)
 
 
@@ -79,6 +84,17 @@ def process(path, admins, update):
             return
         db.execute('INSERT INTO updates VALUES (?)', (update['update_id'],))
         m = update.get('message') or {}
+        callback = update.get('callback_query')
+        if isinstance(callback, dict):
+            actor = callback.get('from') or {}
+            chat = (callback.get('message') or {}).get('chat') or {}
+            data = callback.get('data', '')
+            permitted = actor.get('id') in admins and not actor.get('is_bot') and chat.get('type') == 'private' and chat.get('id') == actor.get('id')
+            valid = isinstance(data, str) and re.fullmatch(r'/(?:list|inbox|view|analyze|sources) [1-9][0-9]{0,6}', data)
+            queue(db, 'answerCallbackQuery', {'callback_query_id': callback.get('id', ''), 'text': 'Открываю…' if permitted and valid else 'Кнопка недоступна.'})
+            if not permitted or not valid:
+                return
+            m = {'from': actor, 'chat': chat, 'text': data}
         # Intake and admin documents are private-chat only, including in groups with admins.
         if m.get('chat', {}).get('type') != 'private' or m.get('from', {}).get('is_bot'):
             return
@@ -86,6 +102,8 @@ def process(path, admins, update):
         if not isinstance(uid, int) or uid != m['chat'].get('id'):
             return
         text = m.get('text', '').strip()
+        text = ADMIN_ACTIONS.get(text, text)
+        menu = ADMIN_MENU if uid in admins else MENU
         cmd = text.split()[0].split('@')[0] if text else ''
         draft = db.execute("SELECT * FROM proposals WHERE user_id=? AND status='draft'", (uid,)).fetchone()
         if cmd in ('/start', '/help'):
@@ -93,7 +111,7 @@ def process(path, admins, update):
                 'Для подачи предложения нажмите «Подать предложение». Ваш Telegram ID, имя, текст и ссылки на файлы будут сохранены и доступны администратору совета. '
                 'По запросу администратора текст предложения и извлечённый текст приложенных Word/PDF могут передаваться OpenAI для подготовки проекта справки. Отправляйте только материалы, которыми вправе делиться. Регистрация предложения не означает его одобрения или включения автора в состав совета.\n'
                 '/done — отправить предложение; /cancel — удалить черновик; /my — мои предложения; /id — мой ID.\n'
-                + ('Администратор: /list [страница], /view НОМЕР, /status НОМЕР new|review|done, /summary, /sources НОМЕР, /analyze НОМЕР (текст заявки и Word/PDF будут переданы OpenAI).' if uid in admins else ''), True)
+                + ('Администратор: /list [страница], /view НОМЕР, /status НОМЕР new|review|done, /summary, /export, /sources НОМЕР, /analyze НОМЕР (текст заявки и Word/PDF будут переданы OpenAI).' if uid in admins else ''), menu)
         elif cmd == '/id' or text == 'Мой ID':
             say(db, uid, f'Ваш Telegram ID: {uid}')
         elif cmd == '/about' or text == 'О совете':
@@ -108,13 +126,13 @@ def process(path, admins, update):
         elif cmd == '/cancel':
             if draft:
                 db.execute('DELETE FROM proposals WHERE id=?', (draft['id'],))
-            say(db, uid, 'Черновик удалён.' if draft else 'Активного черновика нет.', True)
+            say(db, uid, 'Черновик удалён.' if draft else 'Активного черновика нет.', menu)
         elif cmd == '/done':
             if not draft or not draft['body'].strip():
                 say(db, uid, 'Сначала создайте предложение и добавьте описание текстом. Файл не заменяет описание.')
             else:
                 db.execute("UPDATE proposals SET status='new' WHERE id=?", (draft['id'],))
-                say(db, uid, f'Предложение №{draft["id"]} зарегистрировано. Статус: Получено.', True)
+                say(db, uid, f'Предложение №{draft["id"]} зарегистрировано. Статус: Получено.', menu)
                 for admin in admins:
                     say(db, admin, f'Новое предложение №{draft["id"]}. Открыть: /view {draft["id"]}')
         elif cmd == '/my' or text == 'Мои предложения':
@@ -124,21 +142,30 @@ def process(path, admins, update):
             show_sources(db, uid, admins, text)
         elif cmd == '/analyze':
             request_analysis(db, uid, admins, text)
-        elif cmd in ('/list', '/view', '/status', '/summary'):
+        elif cmd in ('/list', '/inbox', '/export', '/view', '/status', '/summary'):
             if uid not in admins:
                 say(db, uid, 'Команда доступна только администратору.')
                 return
             args = text.split()
-            if cmd == '/summary':
+            if cmd == '/export':
+                pending = db.execute("SELECT 1 FROM outbox WHERE method='uploadRegistry' AND state='pending' AND json_extract(payload,'$.chat_id')=?", (uid,)).fetchone()
+                if pending:
+                    say(db, uid, 'Выгрузка уже ожидает отправки.')
+                    return
+                try:
+                    data = build_registry(db, STATUSES)
+                    queue(db, 'uploadRegistry', {'chat_id': uid, 'data': base64.b64encode(data).decode()})
+                    say(db, uid, 'Реестр Excel подготовлен. Сейчас отправлю файл.')
+                except ValueError as error:
+                    say(db, uid, str(error))
+            elif cmd == '/summary':
                 rows = db.execute("SELECT status,count(*) n FROM proposals WHERE status!='draft' GROUP BY status").fetchall()
                 say(db, uid, 'Сводка по статусам (без ИИ):\n' + ('\n'.join(f'{STATUSES[r["status"]]}: {r["n"]}' for r in rows) or 'Нет предложений.'))
-            elif cmd == '/list':
+            elif cmd in ('/list', '/inbox'):
                 if len(args) > 2 or (len(args) == 2 and not re.fullmatch(r'[1-9][0-9]{0,6}', args[1])):
-                    say(db, uid, 'Формат: /list 1')
+                    say(db, uid, 'Формат: /list 1 или /inbox 1')
                     return
-                page = int(args[1]) if len(args) == 2 else 1
-                rows = db.execute("SELECT id,author,status FROM proposals WHERE status!='draft' ORDER BY id DESC LIMIT 20 OFFSET ?", ((page - 1) * 20,)).fetchall()
-                say(db, uid, f'Страница {page}\n' + ('\n'.join(f'№{r["id"]} · {r["author"]} · {STATUSES[r["status"]]}' for r in rows) or 'Нет записей.') + f'\nСледующая: /list {page + 1}')
+                show_registry(db, uid, int(args[1]) if len(args) == 2 else 1, cmd == '/inbox')
             else:
                 if len(args) != (3 if cmd == '/status' else 2) or not re.fullmatch(r'[1-9][0-9]{0,12}', args[1]):
                     say(db, uid, 'Формат: /view НОМЕР или /status НОМЕР new|review|done')
@@ -148,6 +175,7 @@ def process(path, admins, update):
                     say(db, uid, 'Предложение не найдено.')
                 elif cmd == '/view':
                     say(db, uid, f'№{row["id"]} · {STATUSES[row["status"]]}\n{row["created"]} UTC\n{row["author"]}\n\n{row["body"]}')
+                    inline(db, uid, 'Действия по заявке №' + str(row['id']), [[('Анализ ИИ', f'/analyze {row["id"]}'), ('Источники', f'/sources {row["id"]}')]])
                     for file in db.execute('SELECT * FROM files WHERE proposal_id=?', (row['id'],)):
                         queue(db, 'sendDocument', {'chat_id': uid, 'document': file['file_id'], 'caption': f'Предложение №{row["id"]}'})
                 elif args[2] not in STATUSES:
@@ -177,7 +205,55 @@ def process(path, admins, update):
                 db.execute('UPDATE proposals SET body=body || ? WHERE id=?', ('\n' + body, draft['id']))
             say(db, uid, 'Добавлено в черновик. Пришлите ещё материалы или /done для отправки.')
         else:
-            say(db, uid, 'Для подачи материалов нажмите «Подать предложение».', True)
+            say(db, uid, 'Для подачи материалов нажмите «Подать предложение».', menu)
+
+
+def inline(db, uid, text, buttons):
+    queue(db, 'sendMessage', {'chat_id': uid, 'text': text, 'reply_markup': {'inline_keyboard': [[{'text': label, 'callback_data': action} for label, action in row] for row in buttons]}})
+
+
+def show_registry(db, uid, page, only_new=False):
+    condition = "status='new'" if only_new else "status!='draft'"
+    total = db.execute('SELECT count(*) FROM proposals WHERE ' + condition).fetchone()[0]
+    pages = max(1, (total + 9) // 10)
+    page = min(page, pages)
+    rows = db.execute('SELECT id,author,status FROM proposals WHERE ' + condition + ' ORDER BY id DESC LIMIT 10 OFFSET ?', ((page-1)*10,)).fetchall()
+    title = 'Новые заявки' if only_new else 'Все заявки'
+    text = f'{title}: {total}. Страница {page}/{pages}\n' + ('\n'.join(f'№{r["id"]} · {STATUSES[r["status"]]} · {r["author"][:65]}' for r in rows) or 'Нет заявок.')
+    buttons = [[(f'Открыть №{r["id"]}', f'/view {r["id"]}')] for r in rows]
+    command = '/inbox' if only_new else '/list'
+    nav = []
+    if page > 1:
+        nav.append(('Назад', f'{command} {page-1}'))
+    if page < pages:
+        nav.append(('Далее', f'{command} {page+1}'))
+    if nav:
+        buttons.append(nav)
+    inline(db, uid, text, buttons)
+
+
+def deliver_item(token, method, payload, admins):
+    if method != 'uploadRegistry':
+        return api(token, method, payload)
+    if payload.get('chat_id') not in admins:
+        return {'ok': False, 'error_code': 403}
+    boundary = 'Science' + uuid.uuid4().hex
+    data = base64.b64decode(payload['data'])
+    body = (f'--{boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n{payload["chat_id"]}\r\n'
+            f'--{boundary}\r\nContent-Disposition: form-data; name="document"; filename="science-registry.xlsx"\r\n'
+            'Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet\r\n\r\n').encode() + data + f'\r\n--{boundary}--\r\n'.encode()
+    req = urllib.request.Request(f'https://api.telegram.org/bot{token}/sendDocument', data=body,
+                                 headers={'Content-Type': 'multipart/form-data; boundary=' + boundary})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as error:
+        try:
+            return json.loads(error.read())
+        except Exception:
+            return {'ok': False, 'error_code': error.code}
+    except Exception:
+        return {'ok': False, 'error_code': 503}
 
 
 def api(token, method, payload):
@@ -195,14 +271,14 @@ def api(token, method, payload):
         return {'ok': False, 'error_code': 503}
 
 
-def deliver(path, token):
+def deliver(path, token, admins):
     while True:
         with connect(path) as db:
             row = db.execute("SELECT * FROM outbox WHERE state='pending' AND next_try<=? ORDER BY id LIMIT 1", (time.time(),)).fetchone()
         if not row:
             time.sleep(1)
             continue
-        result = api(token, row['method'], json.loads(row['payload']))
+        result = deliver_item(token, row['method'], json.loads(row['payload']), admins)
         with connect(path) as db:
             if result.get('ok'):
                 db.execute('DELETE FROM outbox WHERE id=?', (row['id'],))
@@ -211,6 +287,11 @@ def deliver(path, token):
                 delay = max(result.get('parameters', {}).get('retry_after', 0), min(300, 2 ** min(row['attempts'] + 1, 8)))
                 state = 'failed' if code in (400, 401, 403, 404) else 'pending'
                 db.execute('UPDATE outbox SET attempts=attempts+1,next_try=?,state=? WHERE id=?', (time.time() + delay, state, row['id']))
+                if row['method'] == 'uploadRegistry' and state == 'failed':
+                    recipient = json.loads(row['payload']).get('chat_id')
+                    if recipient in admins:
+                        say(db, recipient, 'Не удалось отправить Excel. Повторите /export. Код Telegram: ' + str(code))
+                    db.execute("UPDATE outbox SET payload='{}' WHERE id=?", (row['id'],))
                 print(f'Delivery failed: outbox={row["id"]}, code={code}, state={state}', flush=True)
         time.sleep(0.1)
 
@@ -494,12 +575,12 @@ def main():
     if not base or not base.startswith('https://'):
         raise SystemExit('PUBLIC_URL or RENDER_EXTERNAL_URL must be an HTTPS service URL.')
     result = api(token, 'setWebhook', {'url': base.rstrip('/') + '/webhook', 'secret_token': secret,
-        'allowed_updates': ['message'], 'max_connections': 1})
+        'allowed_updates': ['message', 'callback_query'], 'max_connections': 1})
     if not result.get('ok'):
         raise SystemExit('Webhook registration failed. Check token, service URL and Telegram availability.')
     recover_analysis(path)
     threading.Thread(target=analysis_worker, args=(path, admins), daemon=True).start()
-    threading.Thread(target=deliver, args=(path, token), daemon=True).start()
+    threading.Thread(target=deliver, args=(path, token, admins), daemon=True).start()
     print('Bot started. Webhook configured.', flush=True)
     ThreadingHTTPServer(('0.0.0.0', int(os.environ.get('PORT', '10000'))), handler_factory(path, secret, admins)).serve_forever()
 
