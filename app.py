@@ -15,6 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from documents import extract_document, MAX_BYTES
 from registry_export import build_registry
+from review_workflow import initialize_review, review_card, review_input
 
 MENU = {'keyboard': [['Подать предложение', 'Мои предложения'], ['О совете', 'Мой ID']], 'resize_keyboard': True}
 ADMIN_MENU = {'keyboard': [['Новые заявки', 'Все заявки'], ['Сводка', 'Выгрузить Excel'], ['Подать предложение', 'Мои предложения'], ['О совете', 'Мой ID']], 'resize_keyboard': True}
@@ -55,6 +56,7 @@ def initialize(path):
           attempts INTEGER DEFAULT 0, next_try REAL DEFAULT 0, state TEXT DEFAULT 'pending');
         ''')
 
+        initialize_review(db)
         columns = {r[1] for r in db.execute('PRAGMA table_info(ai_jobs)')}
         if 'attachments' not in columns:
             db.execute("ALTER TABLE ai_jobs ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'")
@@ -90,7 +92,7 @@ def process(path, admins, update):
             chat = (callback.get('message') or {}).get('chat') or {}
             data = callback.get('data', '')
             permitted = actor.get('id') in admins and not actor.get('is_bot') and chat.get('type') == 'private' and chat.get('id') == actor.get('id')
-            valid = isinstance(data, str) and re.fullmatch(r'/(?:list|inbox|view|analyze|sources) [1-9][0-9]{0,6}', data)
+            valid = isinstance(data, str) and re.fullmatch(r'/(?:(?:list|inbox|view|analyze|sources|history) [1-9][0-9]{0,12}|edit [1-9][0-9]{0,12} (?:topic|assignee|deadline|comment|outcome))', data)
             queue(db, 'answerCallbackQuery', {'callback_query_id': callback.get('id', ''), 'text': 'Открываю…' if permitted and valid else 'Кнопка недоступна.'})
             if not permitted or not valid:
                 return
@@ -106,6 +108,8 @@ def process(path, admins, update):
         menu = ADMIN_MENU if uid in admins else MENU
         cmd = text.split()[0].split('@')[0] if text else ''
         draft = db.execute("SELECT * FROM proposals WHERE user_id=? AND status='draft'", (uid,)).fetchone()
+        if review_input(db, uid, admins, text, cmd, draft, m, say, inline):
+            return
         if cmd in ('/start', '/help'):
             say(db, uid, 'Ғылым — помощник экспертного совета по науке.\n'
                 'Для подачи предложения нажмите «Подать предложение». Ваш Telegram ID, имя, текст и ссылки на файлы будут сохранены и доступны администратору совета. '
@@ -176,12 +180,15 @@ def process(path, admins, update):
                 elif cmd == '/view':
                     say(db, uid, f'№{row["id"]} · {STATUSES[row["status"]]}\n{row["created"]} UTC\n{row["author"]}\n\n{row["body"]}')
                     inline(db, uid, 'Действия по заявке №' + str(row['id']), [[('Анализ ИИ', f'/analyze {row["id"]}'), ('Источники', f'/sources {row["id"]}')]])
+                    review_card(db, uid, row, say, inline)
                     for file in db.execute('SELECT * FROM files WHERE proposal_id=?', (row['id'],)):
                         queue(db, 'sendDocument', {'chat_id': uid, 'document': file['file_id'], 'caption': f'Предложение №{row["id"]}'})
                 elif args[2] not in STATUSES:
                     say(db, uid, 'Допустимые статусы: new, review, done.')
                 else:
                     db.execute('UPDATE proposals SET status=? WHERE id=?', (args[2], row['id']))
+                    if row['status'] != args[2]:
+                        db.execute('INSERT INTO review_history(proposal_id,actor,field,old_value,new_value) VALUES(?,?,?,?,?)', (row['id'], uid, 'Статус', STATUSES[row['status']], STATUSES[args[2]]))
                     say(db, uid, 'Статус обновлён.')
                     say(db, row['user_id'], f'Предложение №{row["id"]}: {STATUSES[args[2]]}.')
         elif cmd.startswith('/'):
