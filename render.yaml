@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: quryltai-science-bot
+    runtime: python
+    plan: starter
+    buildCommand: python -m compileall -q app.py
+    startCommand: python app.py
+    healthCheckPath: /health
+    disk:
+      name: science-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: WEBHOOK_SECRET
+        generateValue: true
+      - key: ADMIN_IDS
+        sync: false
+      - key: DB_PATH
+        value: /var/data/bot.sqlite3
