@@ -19,8 +19,8 @@ from registry_export import build_registry
 from review_workflow import initialize_review, review_card, review_input
 
 MENU = {'keyboard': [['Подать предложение', 'Мои предложения'], ['О совете', 'Мой ID']], 'resize_keyboard': True}
-ADMIN_MENU = {'keyboard': [['Новые заявки', 'Все заявки'], ['Срок сегодня', 'Просрочено'], ['Сводка', 'Выгрузить Excel'], ['Подать предложение', 'Мои предложения'], ['О совете', 'Мой ID']], 'resize_keyboard': True}
-ADMIN_ACTIONS = {'Срок сегодня': '/today', 'Просрочено': '/overdue', 'Новые заявки': '/inbox', 'Все заявки': '/list', 'Сводка': '/summary', 'Выгрузить Excel': '/export'}
+ADMIN_MENU = {'keyboard': [['Новые заявки', 'Все заявки'], ['Срок сегодня', 'Просрочено'], ['Сводка', 'Выгрузить Excel'], ['Напоминания'], ['Подать предложение', 'Мои предложения'], ['О совете', 'Мой ID']], 'resize_keyboard': True}
+ADMIN_ACTIONS = {'Напоминания': '/reminders', 'Срок сегодня': '/today', 'Просрочено': '/overdue', 'Новые заявки': '/inbox', 'Все заявки': '/list', 'Сводка': '/summary', 'Выгрузить Excel': '/export'}
 STATUSES = {'new': 'Получено', 'review': 'На рассмотрении', 'done': 'Рассмотрено'}
 
 
@@ -57,6 +57,13 @@ def initialize(path):
           attempts INTEGER DEFAULT 0, next_try REAL DEFAULT 0, state TEXT DEFAULT 'pending');
         ''')
 
+        db.executescript("""
+        CREATE TABLE IF NOT EXISTS reminder_settings(
+            user_id INTEGER PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS reminder_days(
+            user_id INTEGER NOT NULL, day TEXT NOT NULL, state TEXT NOT NULL,
+            PRIMARY KEY(user_id,day));
+        """)
         initialize_review(db)
         columns = {r[1] for r in db.execute('PRAGMA table_info(ai_jobs)')}
         if 'attachments' not in columns:
@@ -143,6 +150,8 @@ def process(path, admins, update):
         elif cmd == '/my' or text == 'Мои предложения':
             rows = db.execute("SELECT id,status FROM proposals WHERE user_id=? AND status!='draft' ORDER BY id DESC LIMIT 30", (uid,)).fetchall()
             say(db, uid, '\n'.join(f'№{r["id"]}: {STATUSES[r["status"]]}' for r in rows) or 'Отправленных предложений пока нет.')
+        elif cmd == '/reminders':
+            reminders_command(db, uid, admins, text)
         elif cmd == '/sources':
             show_sources(db, uid, admins, text)
         elif cmd == '/analyze':
@@ -280,6 +289,88 @@ def show_deadlines(db, uid, page=1, overdue=False):
     inline(db, uid, '\n'.join(lines), buttons)
 
 
+def astana_now():
+    return datetime.now(timezone(timedelta(hours=5)))
+
+
+def deadline_counts(db, day):
+    row = db.execute("SELECT coalesce(sum(deadline=?),0),coalesce(sum(deadline<?),0) FROM proposals WHERE status IN ('new','review') AND deadline!=''", (day,day)).fetchone()
+    return row[0], row[1]
+
+
+def reminders_command(db, uid, admins, text):
+    if uid not in admins:
+        say(db, uid, 'Команда доступна только администратору.')
+        return
+    args = text.split()
+    action = args[1] if len(args) == 2 else 'status' if len(args) == 1 else ''
+    if action not in ('on', 'off', 'test', 'status'):
+        say(db, uid, 'Команды: /reminders on — включить; /reminders off — отключить; /reminders test — проверить; /reminders — состояние.')
+        return
+    if action in ('on', 'off'):
+        db.execute('INSERT INTO reminder_settings(user_id,enabled) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET enabled=excluded.enabled', (uid, int(action == 'on')))
+        if action == 'off':
+            db.execute("DELETE FROM outbox WHERE method='deadlineDigest' AND state='pending' AND json_extract(payload,'$.chat_id')=?", (uid,))
+            db.execute("UPDATE reminder_days SET state='cancelled' WHERE user_id=? AND state='queued'", (uid,))
+        say(db, uid, 'Сводка включена для вашего личного чата: ежедневно в 09:00 по Астане, только при наличии сроков на сегодня или просрочек. Если сегодня после 09:00 она ещё не проверялась, проверю сейчас.' if action == 'on' else 'Ежедневная сводка отключена для вашего чата. Ожидающие отправки напоминания отменены.')
+    elif action == 'test':
+        pending = db.execute("SELECT 1 FROM outbox WHERE method='deadlineDigest' AND state='pending' AND json_extract(payload,'$.chat_id')=? AND json_extract(payload,'$.test')=1", (uid,)).fetchone()
+        if not pending:
+            queue(db, 'deadlineDigest', {'chat_id': uid, 'day': astana_now().date().isoformat(), 'test': True})
+        say(db, uid, 'Проверочная сводка ожидает отправки. Она не включает расписание и не заменяет утреннюю сводку.')
+    else:
+        row = db.execute('SELECT enabled FROM reminder_settings WHERE user_id=?', (uid,)).fetchone()
+        last = db.execute('SELECT day,state FROM reminder_days WHERE user_id=? ORDER BY day DESC LIMIT 1', (uid,)).fetchone()
+        states = {'queued':'ожидает доставки', 'sent':'отправлена', 'skipped':'пропущена: нет задач, отключена или устарела', 'failed':'ошибка доставки', 'cancelled':'отменена'}
+        detail = f'\nПоследняя проверка: {last["day"]} — {states.get(last["state"],last["state"])}.' if last else '\nПроверок по расписанию пока нет.'
+        say(db, uid, ('Сводка включена.' if row and row['enabled'] else 'Сводка выключена.') + '\nВремя: ежедневно 09:00, Астана (UTC+5). Только для вашего чата.' + detail + '\n/reminders on — включить\n/reminders off — отключить\n/reminders test — проверить отправку')
+
+
+def schedule_digest_once(path, admins, now=None):
+    now = now or astana_now()
+    if now.hour < 9:
+        return
+    day = now.date().isoformat()
+    with connect(path) as db:
+        db.execute('BEGIN IMMEDIATE')
+        today_count, overdue_count = deadline_counts(db, day)
+        for row in db.execute('SELECT user_id FROM reminder_settings WHERE enabled=1').fetchall():
+            uid = row['user_id']
+            if uid not in admins:
+                continue
+            state = 'queued' if today_count or overdue_count else 'skipped'
+            added = db.execute('INSERT OR IGNORE INTO reminder_days(user_id,day,state) VALUES(?,?,?)', (uid,day,state)).rowcount
+            if added and state == 'queued':
+                queue(db, 'deadlineDigest', {'chat_id': uid, 'day': day, 'test': False})
+
+
+def deliver_digest(path, token, payload, admins):
+    uid, day = payload['chat_id'], payload['day']
+    if uid not in admins or day != astana_now().date().isoformat():
+        return {'ok': True, 'skipped': True}
+    with connect(path) as db:
+        settings = db.execute('SELECT enabled FROM reminder_settings WHERE user_id=?', (uid,)).fetchone()
+        if not payload.get('test') and not (settings and settings['enabled']):
+            return {'ok': True, 'skipped': True}
+        today_count, overdue_count = deadline_counts(db, day)
+    if not payload.get('test') and not (today_count or overdue_count):
+        return {'ok': True, 'skipped': True}
+    title = 'Проверочная сводка' if payload.get('test') else 'Контроль сроков'
+    message = f'{title} на {datetime.strptime(day,"%Y-%m-%d").strftime("%d.%m.%Y")} (Астана).\nСрок сегодня: {today_count}\nПросрочено: {overdue_count}\nРассмотренные заявки и заявки без срока не учитываются.'
+    if not today_count and not overdue_count:
+        message += '\nЗаявок для напоминания нет. По расписанию такое сообщение не отправляется.'
+    return api(token, 'sendMessage', {'chat_id': uid, 'text': message, 'reply_markup': {'inline_keyboard': [[{'text':'Срок сегодня', 'callback_data':'/today 1'}, {'text':'Просрочено', 'callback_data':'/overdue 1'}]]}})
+
+
+def reminder_worker(path, admins):
+    while True:
+        try:
+            schedule_digest_once(path, admins)
+        except Exception:
+            print('Reminder scheduler error; will retry.', flush=True)
+        time.sleep(30)
+
+
 def deliver_item(token, method, payload, admins):
     if method != 'uploadRegistry':
         return api(token, method, payload)
@@ -326,8 +417,12 @@ def deliver(path, token, admins):
         if not row:
             time.sleep(1)
             continue
-        result = deliver_item(token, row['method'], json.loads(row['payload']), admins)
+        payload = json.loads(row['payload'])
+        result = deliver_digest(path, token, payload, admins) if row['method'] == 'deadlineDigest' else deliver_item(token, row['method'], payload, admins)
         with connect(path) as db:
+            if row['method'] == 'deadlineDigest' and not payload.get('test'):
+                state = ('skipped' if result.get('skipped') else 'sent') if result.get('ok') else ('failed' if result.get('error_code') in (400, 401, 403, 404) else 'queued')
+                db.execute('UPDATE reminder_days SET state=? WHERE user_id=? AND day=?', (state, payload['chat_id'], payload['day']))
             if result.get('ok'):
                 db.execute('DELETE FROM outbox WHERE id=?', (row['id'],))
             else:
@@ -629,6 +724,7 @@ def main():
     recover_analysis(path)
     threading.Thread(target=analysis_worker, args=(path, admins), daemon=True).start()
     threading.Thread(target=deliver, args=(path, token, admins), daemon=True).start()
+    threading.Thread(target=reminder_worker, args=(path, admins), daemon=True).start()
     print('Bot started. Webhook configured.', flush=True)
     ThreadingHTTPServer(('0.0.0.0', int(os.environ.get('PORT', '10000'))), handler_factory(path, secret, admins)).serve_forever()
 
