@@ -1,5 +1,6 @@
 """Deterministic meeting pack from saved records; no model calls."""
 import io
+import json
 import re
 from docx import Document
 from docx.shared import Cm, Pt, RGBColor
@@ -9,6 +10,31 @@ from docx.oxml.ns import qn
 
 def clean(value):
     return re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]', '', str(value or ''))
+
+
+DRAFT_LABEL = 'ПРОЕКТ ДЛЯ ПРОВЕРКИ ЭКСПЕРТОМ'
+ANALYSIS_HEADINGS = {
+    'Проект справки', '1. Суть проблемы', '2. Предложение автора',
+    '3. Обоснование в исходном тексте',
+    '4. Недостающие сведения и вопросы автору',
+    '5. Вопросы для обсуждения советом',
+}
+
+
+def saved_source(ai):
+    """Use exact saved input, never substitute today's proposal text."""
+    if (ai.get('analysis_source') or '').strip():
+        return ai['analysis_source'], False
+    # Legacy text-only analysis explicitly identified its input scope.
+    try:
+        attachments = json.loads(ai.get('attachments') or '[]')
+    except (TypeError, ValueError):
+        return None, False
+    if (attachments == [] and (ai.get('source') or '').strip()
+            and 'Источник: только текст заявки. Вложения и внешние источники не изучались.'
+            in (ai.get('result') or '')):
+        return ai['source'], True
+    return None, False
 
 
 def build_meeting(db, ids, statuses):
@@ -43,7 +69,11 @@ def build_meeting(db, ids, statuses):
             for key in list(fonts.attrib):
                 if key.endswith('Theme'):
                     del fonts.attrib[key]
+    for name in ('Title', 'Heading 1', 'Heading 2'):
+        doc.styles[name].paragraph_format.keep_with_next = True
+        doc.styles[name].paragraph_format.keep_together = True
     doc.styles['Normal'].paragraph_format.line_spacing = 1.15
+    doc.styles['Normal'].paragraph_format.widow_control = True
     def para(text):
         for line in clean(text).splitlines():
             doc.add_paragraph(line)
@@ -106,14 +136,22 @@ def build_meeting(db, ids, statuses):
             if ai['status'] == 'partial':
                 para('Анализ выполнен частично. Учитывайте ограничения, указанные в справке.')
             for line in clean(ai['result'] or 'Текст справки отсутствует').splitlines():
-                if re.match(r'^#{1,6} ', line):
-                    doc.add_heading(re.sub(r'^#{1,6} ', '', line).replace('**', ''), 2)
+                line = line.strip()
+                plain = re.sub(r'^#{1,6} ', '', line).replace('**', '').strip()
+                if not plain or plain == DRAFT_LABEL:
+                    continue
+                if re.fullmatch(r'Абзацы \[А1\] и далее: /sources [0-9]+', plain):
+                    continue
+                if re.match(r'^#{1,6} ', line) or plain in ANALYSIS_HEADINGS:
+                    doc.add_heading(plain, 2)
                 else:
                     paragraph = doc.add_paragraph()
                     for n, part in enumerate(line.split('**')):
                         paragraph.add_run(part).bold = bool(n % 2)
             doc.add_heading('Источники сохранённого анализа', 2)
-            source = ai['analysis_source']
+            source, restored = saved_source(ai)
+            if restored:
+                para('Источник восстановлен из сохранённого текста, переданного на этот анализ. Вложения в нём не анализировались.')
             para('\n'.join(f'[А{n}] {line}' for n, line in enumerate((p.strip() for p in source.splitlines() if p.strip()), 1)) if source else 'Сохранённый текст источников отсутствует. Ссылки в справке требуют проверки.')
         else:
             para('Анализ ещё не выполнен. Для подготовки справки используйте команду /analyze с номером заявки, затем соберите пакет заново.')
