@@ -16,11 +16,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from documents import extract_document, MAX_BYTES
 from registry_export import build_registry
+from meeting_export import build_meeting
 from review_workflow import initialize_review, review_card, review_input
 
 MENU = {'keyboard': [['Подать предложение', 'Мои предложения'], ['О совете', 'Мой ID']], 'resize_keyboard': True}
-ADMIN_MENU = {'keyboard': [['Новые заявки', 'Все заявки'], ['Срок сегодня', 'Просрочено'], ['Сводка', 'Выгрузить Excel'], ['Напоминания'], ['Подать предложение', 'Мои предложения'], ['О совете', 'Мой ID']], 'resize_keyboard': True}
-ADMIN_ACTIONS = {'Напоминания': '/reminders', 'Срок сегодня': '/today', 'Просрочено': '/overdue', 'Новые заявки': '/inbox', 'Все заявки': '/list', 'Сводка': '/summary', 'Выгрузить Excel': '/export'}
+ADMIN_MENU = {'keyboard': [['Новые заявки', 'Все заявки'], ['Срок сегодня', 'Просрочено'], ['Сводка', 'Выгрузить Excel'], ['Напоминания', 'Материалы Word'], ['Подать предложение', 'Мои предложения'], ['О совете', 'Мой ID']], 'resize_keyboard': True}
+ADMIN_ACTIONS = {'Материалы Word': '/meeting', 'Напоминания': '/reminders', 'Срок сегодня': '/today', 'Просрочено': '/overdue', 'Новые заявки': '/inbox', 'Все заявки': '/list', 'Сводка': '/summary', 'Выгрузить Excel': '/export'}
 STATUSES = {'new': 'Получено', 'review': 'На рассмотрении', 'done': 'Рассмотрено'}
 
 
@@ -123,7 +124,7 @@ def process(path, admins, update):
                 'Для подачи предложения нажмите «Подать предложение». Ваш Telegram ID, имя, текст и ссылки на файлы будут сохранены и доступны администратору совета. '
                 'По запросу администратора текст предложения и извлечённый текст приложенных Word/PDF могут передаваться OpenAI для подготовки проекта справки. Отправляйте только материалы, которыми вправе делиться. Регистрация предложения не означает его одобрения или включения автора в состав совета.\n'
                 '/done — отправить предложение; /cancel — удалить черновик; /my — мои предложения; /id — мой ID.\n'
-                + ('Администратор: /today, /overdue, /list [страница], /view НОМЕР, /status НОМЕР new|review|done, /summary, /export, /sources НОМЕР, /analyze НОМЕР (текст заявки и Word/PDF будут переданы OpenAI).' if uid in admins else ''), menu)
+                + ('Администратор: /today, /overdue, /list [страница], /view НОМЕР, /status НОМЕР new|review|done, /summary, /export, /meeting НОМЕРА, /sources НОМЕР, /analyze НОМЕР (текст заявки и Word/PDF будут переданы OpenAI).' if uid in admins else ''), menu)
         elif cmd == '/id' or text == 'Мой ID':
             say(db, uid, f'Ваш Telegram ID: {uid}')
         elif cmd == '/about' or text == 'О совете':
@@ -150,6 +151,23 @@ def process(path, admins, update):
         elif cmd == '/my' or text == 'Мои предложения':
             rows = db.execute("SELECT id,status FROM proposals WHERE user_id=? AND status!='draft' ORDER BY id DESC LIMIT 30", (uid,)).fetchall()
             say(db, uid, '\n'.join(f'№{r["id"]}: {STATUSES[r["status"]]}' for r in rows) or 'Отправленных предложений пока нет.')
+        elif cmd == '/meeting':
+            if uid not in admins:
+                say(db, uid, 'Команда доступна только администратору.')
+                return
+            parts = text.split()[1:]
+            if not parts or any(not re.fullmatch(r'[1-9][0-9]{0,12}', p) for p in parts):
+                say(db, uid, 'Укажите номера заявок в нужном порядке, до 10: /meeting 1 2')
+                return
+            if db.execute("SELECT 1 FROM outbox WHERE method='uploadMeeting' AND state='pending' AND json_extract(payload,'$.chat_id')=?", (uid,)).fetchone():
+                say(db, uid, 'Пакет Word уже ожидает отправки.')
+                return
+            try:
+                data = build_meeting(db, [int(p) for p in parts], STATUSES)
+                queue(db, 'uploadMeeting', {'chat_id': uid, 'data': base64.b64encode(data).decode()})
+                say(db, uid, 'Материалы Word подготовлены. Сейчас отправлю файл.')
+            except ValueError as error:
+                say(db, uid, str(error))
         elif cmd == '/reminders':
             reminders_command(db, uid, admins, text)
         elif cmd == '/sources':
@@ -372,15 +390,17 @@ def reminder_worker(path, admins):
 
 
 def deliver_item(token, method, payload, admins):
-    if method != 'uploadRegistry':
+    if method not in ('uploadRegistry', 'uploadMeeting'):
         return api(token, method, payload)
     if payload.get('chat_id') not in admins:
         return {'ok': False, 'error_code': 403}
+    filename = 'science-meeting.docx' if method == 'uploadMeeting' else 'science-registry.xlsx'
+    mime = 'application/vnd.openxmlformats-officedocument.' + ('wordprocessingml.document' if method == 'uploadMeeting' else 'spreadsheetml.sheet')
     boundary = 'Science' + uuid.uuid4().hex
     data = base64.b64decode(payload['data'])
     body = (f'--{boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n{payload["chat_id"]}\r\n'
-            f'--{boundary}\r\nContent-Disposition: form-data; name="document"; filename="science-registry.xlsx"\r\n'
-            'Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet\r\n\r\n').encode() + data + f'\r\n--{boundary}--\r\n'.encode()
+            f'--{boundary}\r\nContent-Disposition: form-data; name="document"; filename="{filename}"\r\n'
+            f'Content-Type: {mime}\r\n\r\n').encode() + data + f'\r\n--{boundary}--\r\n'.encode()
     req = urllib.request.Request(f'https://api.telegram.org/bot{token}/sendDocument', data=body,
                                  headers={'Content-Type': 'multipart/form-data; boundary=' + boundary})
     try:
@@ -430,10 +450,10 @@ def deliver(path, token, admins):
                 delay = max(result.get('parameters', {}).get('retry_after', 0), min(300, 2 ** min(row['attempts'] + 1, 8)))
                 state = 'failed' if code in (400, 401, 403, 404) else 'pending'
                 db.execute('UPDATE outbox SET attempts=attempts+1,next_try=?,state=? WHERE id=?', (time.time() + delay, state, row['id']))
-                if row['method'] == 'uploadRegistry' and state == 'failed':
+                if row['method'] in ('uploadRegistry', 'uploadMeeting') and state == 'failed':
                     recipient = json.loads(row['payload']).get('chat_id')
                     if recipient in admins:
-                        say(db, recipient, 'Не удалось отправить Excel. Повторите /export. Код Telegram: ' + str(code))
+                        say(db, recipient, ('Не удалось отправить Word. Повторите /meeting. Код Telegram: ' if row['method'] == 'uploadMeeting' else 'Не удалось отправить Excel. Повторите /export. Код Telegram: ') + str(code))
                     db.execute("UPDATE outbox SET payload='{}' WHERE id=?", (row['id'],))
                 print(f'Delivery failed: outbox={row["id"]}, code={code}, state={state}', flush=True)
         time.sleep(0.1)
