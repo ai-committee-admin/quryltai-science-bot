@@ -1,4 +1,5 @@
 """Ғылым: Telegram intake bot. Text and document analysis."""
+from datetime import datetime, timedelta, timezone
 import base64
 import uuid
 import hashlib
@@ -18,8 +19,8 @@ from registry_export import build_registry
 from review_workflow import initialize_review, review_card, review_input
 
 MENU = {'keyboard': [['Подать предложение', 'Мои предложения'], ['О совете', 'Мой ID']], 'resize_keyboard': True}
-ADMIN_MENU = {'keyboard': [['Новые заявки', 'Все заявки'], ['Сводка', 'Выгрузить Excel'], ['Подать предложение', 'Мои предложения'], ['О совете', 'Мой ID']], 'resize_keyboard': True}
-ADMIN_ACTIONS = {'Новые заявки': '/inbox', 'Все заявки': '/list', 'Сводка': '/summary', 'Выгрузить Excel': '/export'}
+ADMIN_MENU = {'keyboard': [['Новые заявки', 'Все заявки'], ['Срок сегодня', 'Просрочено'], ['Сводка', 'Выгрузить Excel'], ['Подать предложение', 'Мои предложения'], ['О совете', 'Мой ID']], 'resize_keyboard': True}
+ADMIN_ACTIONS = {'Срок сегодня': '/today', 'Просрочено': '/overdue', 'Новые заявки': '/inbox', 'Все заявки': '/list', 'Сводка': '/summary', 'Выгрузить Excel': '/export'}
 STATUSES = {'new': 'Получено', 'review': 'На рассмотрении', 'done': 'Рассмотрено'}
 
 
@@ -92,7 +93,7 @@ def process(path, admins, update):
             chat = (callback.get('message') or {}).get('chat') or {}
             data = callback.get('data', '')
             permitted = actor.get('id') in admins and not actor.get('is_bot') and chat.get('type') == 'private' and chat.get('id') == actor.get('id')
-            valid = isinstance(data, str) and re.fullmatch(r'/(?:(?:list|inbox|view|analyze|sources|history) [1-9][0-9]{0,12}|edit [1-9][0-9]{0,12} (?:topic|assignee|deadline|comment|outcome))', data)
+            valid = isinstance(data, str) and re.fullmatch(r'/(?:(?:list|inbox|today|overdue|view|analyze|sources|history) [1-9][0-9]{0,12}|edit [1-9][0-9]{0,12} (?:topic|assignee|deadline|comment|outcome))', data)
             queue(db, 'answerCallbackQuery', {'callback_query_id': callback.get('id', ''), 'text': 'Открываю…' if permitted and valid else 'Кнопка недоступна.'})
             if not permitted or not valid:
                 return
@@ -115,7 +116,7 @@ def process(path, admins, update):
                 'Для подачи предложения нажмите «Подать предложение». Ваш Telegram ID, имя, текст и ссылки на файлы будут сохранены и доступны администратору совета. '
                 'По запросу администратора текст предложения и извлечённый текст приложенных Word/PDF могут передаваться OpenAI для подготовки проекта справки. Отправляйте только материалы, которыми вправе делиться. Регистрация предложения не означает его одобрения или включения автора в состав совета.\n'
                 '/done — отправить предложение; /cancel — удалить черновик; /my — мои предложения; /id — мой ID.\n'
-                + ('Администратор: /list [страница], /view НОМЕР, /status НОМЕР new|review|done, /summary, /export, /sources НОМЕР, /analyze НОМЕР (текст заявки и Word/PDF будут переданы OpenAI).' if uid in admins else ''), menu)
+                + ('Администратор: /today, /overdue, /list [страница], /view НОМЕР, /status НОМЕР new|review|done, /summary, /export, /sources НОМЕР, /analyze НОМЕР (текст заявки и Word/PDF будут переданы OpenAI).' if uid in admins else ''), menu)
         elif cmd == '/id' or text == 'Мой ID':
             say(db, uid, f'Ваш Telegram ID: {uid}')
         elif cmd == '/about' or text == 'О совете':
@@ -146,7 +147,7 @@ def process(path, admins, update):
             show_sources(db, uid, admins, text)
         elif cmd == '/analyze':
             request_analysis(db, uid, admins, text)
-        elif cmd in ('/list', '/inbox', '/export', '/view', '/status', '/summary'):
+        elif cmd in ('/list', '/inbox', '/today', '/overdue', '/export', '/view', '/status', '/summary'):
             if uid not in admins:
                 say(db, uid, 'Команда доступна только администратору.')
                 return
@@ -165,6 +166,11 @@ def process(path, admins, update):
             elif cmd == '/summary':
                 rows = db.execute("SELECT status,count(*) n FROM proposals WHERE status!='draft' GROUP BY status").fetchall()
                 say(db, uid, 'Сводка по статусам (без ИИ):\n' + ('\n'.join(f'{STATUSES[r["status"]]}: {r["n"]}' for r in rows) or 'Нет предложений.'))
+            elif cmd in ('/today', '/overdue'):
+                if len(args) > 2 or (len(args) == 2 and not re.fullmatch(r'[1-9][0-9]{0,6}', args[1])):
+                    say(db, uid, 'Формат: /today 1 или /overdue 1')
+                    return
+                show_deadlines(db, uid, int(args[1]) if len(args) == 2 else 1, cmd == '/overdue')
             elif cmd in ('/list', '/inbox'):
                 if len(args) > 2 or (len(args) == 2 and not re.fullmatch(r'[1-9][0-9]{0,6}', args[1])):
                     say(db, uid, 'Формат: /list 1 или /inbox 1')
@@ -237,6 +243,41 @@ def show_registry(db, uid, page, only_new=False):
     if nav:
         buttons.append(nav)
     inline(db, uid, text, buttons)
+
+
+def astana_today():
+    return datetime.now(timezone(timedelta(hours=5))).date()
+
+
+def show_deadlines(db, uid, page=1, overdue=False):
+    today = astana_today()
+    comparison = '<' if overdue else '='
+    condition = "status IN ('new','review') AND deadline!='' AND deadline " + comparison + ' ?'
+    params = (today.isoformat(),)
+    total = db.execute('SELECT count(*) FROM proposals WHERE ' + condition, params).fetchone()[0]
+    pages = max(1, (total + 9) // 10)
+    page = min(max(1, page), pages)
+    rows = db.execute('SELECT id,deadline,assignee FROM proposals WHERE ' + condition + ' ORDER BY deadline,id LIMIT 10 OFFSET ?', params + ((page-1)*10,)).fetchall()
+    title = 'Просрочено' if overdue else 'Срок сегодня'
+    lines = [f'{title}: {total}. На {today.strftime("%d.%m.%Y")} (Астана, UTC+5).', f'Страница {page}/{pages}']
+    for row in rows:
+        due = datetime.strptime(row['deadline'], '%Y-%m-%d').date()
+        label = ' · просрочка: ' + str((today-due).days) + ' дн.' if overdue else ''
+        assignee = ' '.join(row['assignee'].split())[:65] or 'не назначен'
+        lines.append(f'№{row["id"]} · {due.strftime("%d.%m.%Y")}{label} · {assignee}')
+    if not rows:
+        lines.append('Нет просроченных заявок.' if overdue else 'На сегодня сроков нет.')
+    lines.append('Только статусы «Получено» и «На рассмотрении» с указанным сроком.')
+    buttons = [[(f'Открыть №{row["id"]}', f'/view {row["id"]}')] for row in rows]
+    command = '/overdue' if overdue else '/today'
+    nav = []
+    if page > 1:
+        nav.append(('Назад', f'{command} {page-1}'))
+    if page < pages:
+        nav.append(('Далее', f'{command} {page+1}'))
+    if nav:
+        buttons.append(nav)
+    inline(db, uid, '\n'.join(lines), buttons)
 
 
 def deliver_item(token, method, payload, admins):
