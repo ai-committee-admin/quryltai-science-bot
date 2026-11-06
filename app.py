@@ -16,12 +16,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from documents import extract_document, MAX_BYTES
 from registry_export import build_registry
+from site_import import initialize_import, start_import
 from meeting_export import build_meeting
 from review_workflow import initialize_review, review_card, review_input
 
 MENU = {'keyboard': [['Подать предложение', 'Мои предложения'], ['О совете', 'Мой ID']], 'resize_keyboard': True}
-ADMIN_MENU = {'keyboard': [['Новые заявки', 'Все заявки'], ['Срок сегодня', 'Просрочено'], ['Сводка', 'Выгрузить Excel'], ['Напоминания', 'Материалы Word'], ['Подать предложение', 'Мои предложения'], ['О совете', 'Мой ID']], 'resize_keyboard': True}
-ADMIN_ACTIONS = {'Материалы Word': '/meeting', 'Напоминания': '/reminders', 'Срок сегодня': '/today', 'Просрочено': '/overdue', 'Новые заявки': '/inbox', 'Все заявки': '/list', 'Сводка': '/summary', 'Выгрузить Excel': '/export'}
+ADMIN_MENU = {'keyboard': [['Новые заявки', 'Все заявки'], ['Срок сегодня', 'Просрочено'], ['Сводка', 'Выгрузить Excel'], ['Напоминания', 'Материалы Word'], ['Импорт с сайта'], ['Подать предложение', 'Мои предложения'], ['О совете', 'Мой ID']], 'resize_keyboard': True}
+ADMIN_ACTIONS = {'Импорт с сайта': '/import', 'Материалы Word': '/meeting', 'Напоминания': '/reminders', 'Срок сегодня': '/today', 'Просрочено': '/overdue', 'Новые заявки': '/inbox', 'Все заявки': '/list', 'Сводка': '/summary', 'Выгрузить Excel': '/export'}
 STATUSES = {'new': 'Получено', 'review': 'На рассмотрении', 'done': 'Рассмотрено'}
 
 
@@ -66,6 +67,7 @@ def initialize(path):
             PRIMARY KEY(user_id,day));
         """)
         initialize_review(db)
+        initialize_import(db)
         columns = {r[1] for r in db.execute('PRAGMA table_info(ai_jobs)')}
         if 'attachments' not in columns:
             db.execute("ALTER TABLE ai_jobs ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'")
@@ -119,18 +121,26 @@ def process(path, admins, update):
         draft = db.execute("SELECT * FROM proposals WHERE user_id=? AND status='draft'", (uid,)).fetchone()
         if review_input(db, uid, admins, text, cmd, draft, m, say, inline):
             return
+        if draft and draft['external_id'] and uid not in admins and cmd != '/cancel':
+            say(db, uid, 'Доступ к импорту отозван. /cancel — удалить свой черновик.')
+            return
         if cmd in ('/start', '/help'):
             say(db, uid, 'Ғылым — помощник экспертного совета по науке.\n'
                 'Для подачи предложения нажмите «Подать предложение». Ваш Telegram ID, имя, текст и ссылки на файлы будут сохранены и доступны администратору совета. '
                 'По запросу администратора текст предложения и извлечённый текст приложенных Word/PDF могут передаваться OpenAI для подготовки проекта справки. Отправляйте только материалы, которыми вправе делиться. Регистрация предложения не означает его одобрения или включения автора в состав совета.\n'
                 '/done — отправить предложение; /cancel — удалить черновик; /my — мои предложения; /id — мой ID.\n'
-                + ('Администратор: /today, /overdue, /list [страница], /view НОМЕР, /status НОМЕР new|review|done, /summary, /export, /meeting НОМЕРА, /sources НОМЕР, /analyze НОМЕР (текст заявки и Word/PDF будут переданы OpenAI).' if uid in admins else ''), menu)
+                + ('Администратор: /today, /overdue, /list [страница], /view НОМЕР, /status НОМЕР new|review|done, /summary, /export, /import, /meeting НОМЕРА, /sources НОМЕР, /analyze НОМЕР (текст заявки и Word/PDF будут переданы OpenAI).' if uid in admins else ''), menu)
         elif cmd == '/id' or text == 'Мой ID':
             say(db, uid, f'Ваш Telegram ID: {uid}')
         elif cmd == '/about' or text == 'О совете':
             say(db, uid, 'Совет по науке и научно-технологическому развитию осуществляет экспертное сопровождение работы Комитета по цифровизации, инновациям и науке Курултая РК. '
                 'Рекомендации совета носят рекомендательный характер. Персональный состав утверждается Комитетом.')
+        elif cmd == '/import':
+            start_import(db, uid, admins, text, say)
         elif cmd == '/new' or text == 'Подать предложение':
+            if draft and draft['external_id']:
+                say(db, uid, 'Открыт черновик импорта с сайта. Завершите /done или отмените /cancel.')
+                return
             if not draft:
                 author = ' '.join(str(m['from'].get(k, '')) for k in ('first_name', 'last_name')).strip()
                 db.execute('INSERT INTO proposals(user_id,author) VALUES (?,?)', (uid, author))
@@ -149,7 +159,7 @@ def process(path, admins, update):
                 for admin in admins:
                     say(db, admin, f'Новое предложение №{draft["id"]}. Открыть: /view {draft["id"]}')
         elif cmd == '/my' or text == 'Мои предложения':
-            rows = db.execute("SELECT id,status FROM proposals WHERE user_id=? AND status!='draft' ORDER BY id DESC LIMIT 30", (uid,)).fetchall()
+            rows = db.execute("SELECT id,status FROM proposals WHERE user_id=? AND status!='draft' AND external_id='' ORDER BY id DESC LIMIT 30", (uid,)).fetchall()
             say(db, uid, '\n'.join(f'№{r["id"]}: {STATUSES[r["status"]]}' for r in rows) or 'Отправленных предложений пока нет.')
         elif cmd == '/meeting':
             if uid not in admins:
@@ -211,6 +221,8 @@ def process(path, admins, update):
                 if not row:
                     say(db, uid, 'Предложение не найдено.')
                 elif cmd == '/view':
+                    if row['external_id']:
+                        say(db, uid, f'Источник: {row["source_site"]} · {row["external_id"]}\nАвтор указан администратором по материалам сайта. Дата создания — дата импорта в бот.')
                     say(db, uid, f'№{row["id"]} · {STATUSES[row["status"]]}\n{row["created"]} UTC\n{row["author"]}\n\n{row["body"]}')
                     inline(db, uid, 'Действия по заявке №' + str(row['id']), [[('Анализ ИИ', f'/analyze {row["id"]}'), ('Источники', f'/sources {row["id"]}')]])
                     review_card(db, uid, row, say, inline)
@@ -223,7 +235,8 @@ def process(path, admins, update):
                     if row['status'] != args[2]:
                         db.execute('INSERT INTO review_history(proposal_id,actor,field,old_value,new_value) VALUES(?,?,?,?,?)', (row['id'], uid, 'Статус', STATUSES[row['status']], STATUSES[args[2]]))
                     say(db, uid, 'Статус обновлён.')
-                    say(db, row['user_id'], f'Предложение №{row["id"]}: {STATUSES[args[2]]}.')
+                    if not row['external_id']:
+                        say(db, row['user_id'], f'Предложение №{row["id"]}: {STATUSES[args[2]]}.')
         elif cmd.startswith('/'):
             say(db, uid, 'Неизвестная команда. Справка: /help')
         elif draft:

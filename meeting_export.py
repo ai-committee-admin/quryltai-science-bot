@@ -94,7 +94,7 @@ def build_meeting(db, ids, statuses):
     table.rows[0]._tr.get_or_add_trPr().append(header)
     for i, (row, ai, files) in enumerate(records, 1):
         title = row['topic'] or f'Рассмотрение предложения №{row["id"]}'
-        for cell, value in zip(table.add_row().cells, [str(i), title, f'Заявка №{row["id"]}', 'Не определён']):
+        for cell, value in zip(table.add_row().cells, [str(i), title, row.get('external_id') or f'Заявка №{row["id"]}', 'Не определён']):
             cell.text = clean(value)
     for index, tr in enumerate(table.rows):
         for cell, width in zip(tr.cells, widths):
@@ -117,7 +117,10 @@ def build_meeting(db, ids, statuses):
         doc.add_heading(f'Вопрос {i}   Предложение №{row["id"]}', 1)
         if row['topic']:
             para(row['topic'])
-        para(f'Автор — имя в Telegram: {row["author"]}\nДата создания записи UTC: {row["created"]}\nСтатус: {statuses.get(row["status"], row["status"])}\nОтветственный: {row["assignee"] or "Не назначен"}\nСрок рассмотрения: {row["deadline"] or "Не установлен"}')
+        if row.get('external_id'):
+            para(f'Источник: {row["source_site"]}\nНомер на сайте: {row["external_id"]}\nДата создания записи ниже — дата импорта в бот.')
+        author_label = 'Автор по материалам сайта' if row.get('external_id') else 'Автор — имя в Telegram'
+        para(f'{author_label}: {row["author"]}\nДата создания записи UTC: {row["created"]}\nСтатус: {statuses.get(row["status"], row["status"])}\nОтветственный: {row["assignee"] or "Не назначен"}\nСрок рассмотрения: {row["deadline"] or "Не установлен"}')
         doc.add_heading('Комментарий администратора', 2)
         para(row['comment'] or 'Не внесён')
         doc.add_heading('Позиция эксперта', 2)
