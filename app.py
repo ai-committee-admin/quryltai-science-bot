@@ -175,7 +175,11 @@ def process(path, admins, update):
             try:
                 data = build_meeting(db, [int(p) for p in parts], STATUSES)
                 queue(db, 'uploadMeeting', {'chat_id': uid, 'data': base64.b64encode(data).decode()})
-                say(db, uid, 'Материалы Word подготовлены. Сейчас отправлю файл.')
+                for pid in map(int, parts):
+                    for file in db.execute('SELECT file_id,name FROM files WHERE proposal_id=? ORDER BY id', (pid,)):
+                        if file['name'].lower().endswith('.pdf'):
+                            queue(db, 'sendDocument', {'chat_id': uid, 'document': file['file_id'], 'caption': f'Оригинал PDF к предложению №{pid}'})
+                say(db, uid, 'Материалы Word подготовлены. PDF-приложения отправляю отдельно в исходном виде.')
             except ValueError as error:
                 say(db, uid, str(error))
         elif cmd == '/reminders':

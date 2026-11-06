@@ -132,7 +132,7 @@ def build_meeting(db, ids, statuses):
         doc.add_heading('Приложенные файлы', 2)
         para('\n'.join(files) if files else 'Нет приложенных файлов')
         if files:
-            para('В пакет включён перечень файлов. Оригиналы доступны в карточке заявки в боте.')
+            para('В пакет включён перечень файлов. Оригиналы PDF отправляются ботом отдельно без преобразования. Все вложения также доступны в карточке заявки.')
         doc.add_heading('Сохранённая ИИ справка', 2)
         if ai:
             para(f'ПРОЕКТ ДЛЯ ПРОВЕРКИ ЭКСПЕРТОМ\nДата анализа UTC: {ai["created"]}')
@@ -145,17 +145,14 @@ def build_meeting(db, ids, statuses):
                     continue
                 if re.fullmatch(r'Абзацы \[А1\] и далее: /sources [0-9]+', plain):
                     continue
+                line = re.sub(r'\s*\[[АA][0-9]+(?:\s*[–—-]\s*[АA]?[0-9]+)?(?:\s*[;,]\s*[АA]?[0-9]+(?:\s*[–—-]\s*[АA]?[0-9]+)?)*\]', '', line)
+                plain = re.sub(r'^#{1,6} ', '', line).replace('**', '').strip()
                 if re.match(r'^#{1,6} ', line) or plain in ANALYSIS_HEADINGS:
                     doc.add_heading(plain, 2)
                 else:
                     paragraph = doc.add_paragraph()
                     for n, part in enumerate(line.split('**')):
                         paragraph.add_run(part).bold = bool(n % 2)
-            doc.add_heading('Источники сохранённого анализа', 2)
-            source, restored = saved_source(ai)
-            if restored:
-                para('Источник восстановлен из сохранённого текста, переданного на этот анализ. Вложения в нём не анализировались.')
-            para('\n'.join(f'[А{n}] {line}' for n, line in enumerate((p.strip() for p in source.splitlines() if p.strip()), 1)) if source else 'Сохранённый текст источников отсутствует. Ссылки в справке требуют проверки.')
         else:
             para('Анализ ещё не выполнен. Для подготовки справки используйте команду /analyze с номером заявки, затем соберите пакет заново.')
     output = io.BytesIO()
