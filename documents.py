@@ -80,10 +80,15 @@ def extract_document(data, name):
 
 if __name__ == '__main__':
     try:
+        # Read the bounded input before restricting virtual memory. Under some
+        # Python runtimes, a 384 MiB address-space cap prevents stdin.read().
+        data = sys.stdin.buffer.read(MAX_BYTES + 1)
+        if len(data) > MAX_BYTES:
+            raise ValueError('файл больше 10 МБ')
         import resource
-        resource.setrlimit(resource.RLIMIT_AS, (384 * 1024 * 1024,) * 2)
+        resource.setrlimit(resource.RLIMIT_AS, (768 * 1024 * 1024,) * 2)
         resource.setrlimit(resource.RLIMIT_CPU, (20, 20))
-        result = extract(sys.stdin.buffer.read(MAX_BYTES + 1), sys.argv[1])
+        result = extract(data, sys.argv[1])
     except ValueError as exc:
         result = {'error': str(exc)}
     except Exception:
