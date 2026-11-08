@@ -37,7 +37,7 @@ def is_chair(db, chat, uid, admins):
     return uid in admins or bool(db.execute('SELECT 1 FROM council_chairs WHERE chat=? AND uid=?',(chat,uid)).fetchone())
 
 
-def task_card(db, queue, task):
+def task_card(db, queue, task, existing=None):
     members = db.execute('SELECT * FROM council_members WHERE task=? ORDER BY uid',(task['id'],)).fetchall()
     tid=task['id']
     text=f'Задание №{tid} · ' + ('Закрыто' if task['closed'] else 'Открыто') + '\n' + task['body'] + '\nСрок: ' + (task['deadline'] or 'не установлен')
@@ -47,7 +47,13 @@ def task_card(db, queue, task):
     buttons += [[('Материалы и результаты',f'g:results:{tid}'),('Обновить карточку',f'g:card:{tid}')]]
     if not task['closed']:
         buttons += [[('Закрыть задание',f'g:close:{tid}')]]
-    emit(db,queue,task['chat'],text,buttons,tid)
+    if existing and existing.get('message_id') and len(text)<=3500:
+        markup={'inline_keyboard':[[{'text':label,'callback_data':data} for label,data in row] for row in buttons]}
+        if existing.get('text')!=text or existing.get('reply_markup')!=markup:
+            queue(db,'editMessageText',{'chat_id':task['chat'],'message_id':existing['message_id'],
+                  'text':text,'reply_markup':markup,'_council':True,'_council_task':tid})
+    else:
+        emit(db,queue,task['chat'],text,buttons,tid)
 
 
 def attach(db, queue, task, uid, m, chair):
@@ -71,8 +77,7 @@ def attach(db, queue, task, uid, m, chair):
     db.execute('INSERT OR IGNORE INTO council_materials(task,uid,revision,body,file_id,name,message) VALUES(?,?,?,?,?,?,?)',
                (tid,uid,rev,body,doc.get('file_id',''),doc.get('file_name','Документ'),m['message_id']))
     db.execute('INSERT OR IGNORE INTO council_links VALUES(?,?,?)',(chat,m['message_id'],tid))
-    emit(db,queue,chat,f'Материал сохранён к заданию №{tid}.' + (' Добавьте остальные сообщения и файлы, затем нажмите «Сдать результат».' if rev else ' Это исходный материал задания.'),
-         [[('Сдать результат',f'g:submit:{tid}')]] if rev else (),tid, m['message_id'])
+
 
 
 def results(db,queue,task):
@@ -103,7 +108,7 @@ def handle_group(db,admins,update,queue):
     if not cb and cmd in ('/council_on','/council_off') and uid in admins:
         db.execute('INSERT INTO council_groups VALUES(?,?) ON CONFLICT(chat) DO UPDATE SET enabled=excluded.enabled',(cid,int(cmd=='/council_on')))
         # Plain output for off command must still be delivered.
-        queue(db,'sendMessage',{'chat_id':cid,'text':'Работа с заданиями включена. Депутат/администратор пишет текст или отправляет документ, затем нажимает «Создать задание». /grouphelp — инструкция.' if cmd=='/council_on' else 'Приём заданий в этом чате отключён.'})
+        queue(db,'sendMessage',{'chat_id':cid,'text':'Задания включены. Для нового задания начните сообщение с «Задание:». /grouphelp — помощь.' if cmd=='/council_on' else 'Приём заданий в этом чате отключён.'})
         return True
     enabled=db.execute('SELECT enabled FROM council_groups WHERE chat=?',(cid,)).fetchone()
     if not enabled or not enabled[0]:
@@ -111,7 +116,11 @@ def handle_group(db,admins,update,queue):
         return True
     chair=is_chair(db,cid,uid,admins)
     if cb:
-        queue(db,'answerCallbackQuery',{'callback_query_id':cb['id'],'text':'Проверяю…'})
+        queue(db,'answerCallbackQuery',{'callback_query_id':cb['id']})
+        ack_id=db.execute('SELECT last_insert_rowid()').fetchone()[0]
+        def feedback(text):
+            db.execute('UPDATE outbox SET payload=? WHERE id=?',
+                       (json.dumps({'callback_query_id':cb['id'],'text':text},ensure_ascii=False),ack_id))
         data=cb.get('data','')
         if not re.fullmatch(r'g:[a-z]+:[0-9]+(?::[0-9]+){0,2}',data):return True
         _,action,*nums=data.split(':');nums=list(map(int,nums));tid=nums[0]
@@ -129,7 +138,7 @@ def handle_group(db,admins,update,queue):
                 # Save original source, including a document without a caption.
                 attach(db,queue,task,uid,original,True)
                 db.execute('UPDATE council_pending SET used=1,payload=\'{}\' WHERE id=?',(tid,))
-                task_card(db,queue,task)
+                task_card(db,queue,task,m)
             elif action=='choose':
                 offset=nums[1] if len(nums)>1 else 0
                 tasks=db.execute("SELECT t.* FROM council_tasks t JOIN council_members m ON m.task=t.id WHERE t.chat=? AND t.closed=0 AND m.uid=? AND m.state IN ('working','revision') ORDER BY t.id LIMIT 11 OFFSET ?",(cid,uid,offset)).fetchall()
@@ -149,30 +158,31 @@ def handle_group(db,admins,update,queue):
         if action=='recommend':
             from expert_profiles import group_profiles
             group_profiles(db,queue,cid,uid,f'/recommend {tid}')
-        elif action=='card':task_card(db,queue,task)
+        elif action=='card':task_card(db,queue,task,m)
         elif action=='results':results(db,queue,task)
         elif task['closed']:emit(db,queue,cid,'Задание закрыто.')
         elif action=='take':
             name=' '.join(actor.get(k,'') for k in ('first_name','last_name')).strip() or str(uid)
-            db.execute('INSERT OR IGNORE INTO council_members(task,uid,name) VALUES(?,?,?)',(tid,uid,name))
-            emit(db,queue,cid,f'{name}: участие в задании №{tid} зарегистрировано. Отвечайте текстом или документами на карточку, затем нажмите «Сдать результат».',task=tid)
+            added=db.execute('INSERT OR IGNORE INTO council_members(task,uid,name) VALUES(?,?,?)',(tid,uid,name)).rowcount
+            feedback('Вы взяли задание. Ответьте на карточку текстом или файлом.' if added else 'Вы уже участвуете в этом задании.')
+            if added:task_card(db,queue,task,m)
         elif action=='submit':
             if not member or member['state'] not in ('working','revision'):
                 emit(db,queue,cid,'Сначала возьмите задание. Уже сданный результат повторно сдавать не нужно.');return True
             if not db.execute('SELECT 1 FROM council_materials WHERE task=? AND uid=? AND revision=?',(tid,uid,member['revision'])).fetchone():
                 emit(db,queue,cid,'Сначала отправьте текст или документ ответом на карточку задания.');return True
             db.execute("UPDATE council_members SET state='submitted' WHERE task=? AND uid=?",(tid,uid))
-            emit(db,queue,cid,f'{member["name"]} сдал результат задания №{tid}. Остальные эксперты продолжают работу.',
+            emit(db,queue,cid,f'{member["name"]} · задание №{tid}: результат сдан.',
                  [[('Посмотреть результаты',f'g:results:{tid}')]],tid)
         elif action in ('accept','revise') and len(nums)==3 and chair:
             target,rev=nums[1:]
             changed=db.execute("UPDATE council_members SET state=?,revision=revision+? WHERE task=? AND uid=? AND state='submitted' AND revision=?",('accepted' if action=='accept' else 'revision',int(action=='revise'),tid,target,rev)).rowcount
-            if changed:emit(db,queue,cid,f'Задание №{tid}, эксперт {target}: '+('результат принят.' if action=='accept' else 'возвращено на доработку. Депутат: напишите замечания ответом на карточку. Эксперт: добавьте исправленный результат и сдайте его повторно.'),task=tid)
+            if changed:emit(db,queue,cid,f'Задание №{tid}, эксперт {target}: '+('результат принят.' if action=='accept' else 'на доработке.'),task=tid)
             else:emit(db,queue,cid,'Эта версия уже рассмотрена. Откройте актуальные результаты.')
         elif action=='close' and chair:
-            emit(db,queue,cid,'Закрыть задание для всех экспертов? После закрытия новые результаты не принимаются.',[[('Подтвердить закрытие',f'g:confirm:{tid}')]],tid)
+            emit(db,queue,cid,'Закрыть задание для всех экспертов?',[[('Подтвердить закрытие',f'g:confirm:{tid}')]],tid)
         elif action=='confirm' and chair:
-            db.execute('UPDATE council_tasks SET closed=1 WHERE id=?',(tid,));emit(db,queue,cid,f'Задание №{tid} закрыто депутатом/администратором.')
+            db.execute('UPDATE council_tasks SET closed=1 WHERE id=?',(tid,));emit(db,queue,cid,f'Задание №{tid} закрыто.')
         elif action in ('accept','revise','close','confirm'):
             emit(db,queue,cid,'Это действие доступно депутату или администратору бота.')
         return True
@@ -200,7 +210,29 @@ def handle_group(db,admins,update,queue):
         rows=db.execute('SELECT * FROM council_tasks WHERE chat=? ORDER BY id DESC LIMIT 10 OFFSET ?',(cid,offset)).fetchall()
         emit(db,queue,cid,'Задания этого чата. Следующая страница: /tasks '+str(offset+10),[[(f'№{t["id"]}: {t["body"][:45]}',f'g:card:{t["id"]}')] for t in rows]);return True
     if cmd=='/grouphelp':
-        emit(db,queue,cid,'Депутат пишет задание или отправляет документ → «Создать задание». Эксперты: «Взять в работу» → текст/файл ответом на карточку → «Сдать результат». Несколько сообщений допускаются. Без ответа на карточку: «Привязать к заданию».\n/tasks — список; /due НОМЕР ДД.ММ.ГГГГ — срок. Приём и возврат доступны депутату и администратору. Оригинальные документы доступны через «Материалы и результаты».\nСообщения и документы учитываются только после подключения этого чата. Редактирование старых сообщений не обновляет материалы: отправьте исправление новым сообщением.');return True
+        emit(db,queue,cid,'Новое задание: начните сообщение с «Задание:» или отправьте /task ответом на текст/документ.\nЭксперт: «Взять в работу» → ответ на карточку текстом/файлом → «Сдать результат». Материалы сохраняются без отдельных уведомлений.\nДля привязки ранее отправленного сообщения: /attach ответом на своё сообщение.\n/tasks — задания; /due НОМЕР ДД.ММ.ГГГГ — срок.');return True
+    # Deliberate intake replaces a prompt under every ordinary chat message.
+    deliberate_task = chair and (cmd=='/task' or text.casefold().startswith('задание:'))
+    deliberate_attach = cmd=='/attach'
+    if deliberate_task or deliberate_attach:
+        original=m.get('reply_to_message') if cmd in ('/task','/attach') else m
+        if not original and cmd=='/task' and len(parts)>1:
+            original=dict(m,text=text.split(None,1)[1])
+        if not original or not original.get('message_id') or not (original.get('text') or original.get('document')):
+            emit(db,queue,cid,'Отправьте команду ответом на нужный текст или документ.');return True
+        if deliberate_attach and (original.get('from',{}).get('id')!=uid or original.get('sender_chat')):
+            emit(db,queue,cid,'Можно привязать только своё сообщение.');return True
+        if db.execute('SELECT 1 FROM council_links WHERE chat=? AND message=?',(cid,original['message_id'])).fetchone():
+            emit(db,queue,cid,'Это сообщение уже относится к заданию.');return True
+        db.execute('INSERT OR IGNORE INTO council_pending(chat,uid,message,payload) VALUES(?,?,?,?)',
+                   (cid,uid,original['message_id'],json.dumps({k:original[k] for k in ('text','caption','document','message_id') if k in original},ensure_ascii=False)))
+        pending=db.execute('SELECT * FROM council_pending WHERE chat=? AND message=?',(cid,original['message_id'])).fetchone()
+        if pending['uid']!=uid or pending['used']:
+            emit(db,queue,cid,'Это сообщение уже обработано.');return True
+        pid=pending['id']
+        buttons=[[('Создать задание',f'g:create:{pid}')]] if deliberate_task else [[('Привязать к заданию',f'g:choose:{pid}')]]
+        emit(db,queue,cid,'Создать задание?' if deliberate_task else 'Выберите задание для материала.',buttons,reply=original['message_id'])
+        return True
     if cmd.startswith('/') or not m.get('message_id'):return True
     if not (m.get('text') or m.get('document')):return True
     reply=(m.get('reply_to_message') or {}).get('message_id')
@@ -208,12 +240,6 @@ def handle_group(db,admins,update,queue):
     if linked:
         task=db.execute('SELECT * FROM council_tasks WHERE id=? AND chat=?',(linked[0],cid)).fetchone()
         if task:attach(db,queue,task,uid,m,chair)
-    else:
-        db.execute('INSERT OR IGNORE INTO council_pending(chat,uid,message,payload) VALUES(?,?,?,?)',(cid,uid,m['message_id'],json.dumps({k:m[k] for k in ('text','caption','document','message_id') if k in m},ensure_ascii=False)))
-        pid=db.execute('SELECT id FROM council_pending WHERE chat=? AND message=?',(cid,m['message_id'])).fetchone()[0]
-        buttons=[[('Создать задание',f'g:create:{pid}')]] if chair else [[('Привязать к заданию',f'g:choose:{pid}')]]
-        buttons.append([('Не учитывать',f'g:ignore:{pid}')])
-        emit(db,queue,cid,'Учесть это сообщение?' if chair else 'Если это результат работы, привяжите его к заданию.',buttons,reply=m['message_id'])
     return True
 
 
@@ -221,6 +247,9 @@ def schedule_groups(db,queue,now):
     if now.hour<9:return
     day=now.date().isoformat()
     rows=db.execute("SELECT t.*,m.uid,m.name FROM council_tasks t JOIN council_groups g ON g.chat=t.chat JOIN council_members m ON m.task=t.id WHERE g.enabled=1 AND t.closed=0 AND t.deadline!='' AND t.deadline<=? AND m.state IN ('working','revision')",(day,)).fetchall()
+    grouped={}
     for r in rows:
         if db.execute('INSERT OR IGNORE INTO council_reminders VALUES(?,?,?)',(r['id'],r['uid'],day)).rowcount:
-            emit(db,queue,r['chat'],f'{r["name"]}: '+('сегодня срок' if r['deadline']==day else 'просрочен срок')+f' по заданию №{r["id"]}. Срок: {r["deadline"]}. Результат ещё не сдан.',task=r['id'])
+            grouped.setdefault((r['chat'],r['id'],r['deadline']),[]).append(r['name'])
+    for (chat,tid,deadline),names in grouped.items():
+        emit(db,queue,chat,f'№{tid} · '+('срок сегодня' if deadline==day else 'срок просрочен')+'\nОжидаются: '+', '.join(names),task=tid)

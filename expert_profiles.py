@@ -178,5 +178,5 @@ def group_profiles(db,queue,cid,uid,text):
         for p in db.execute('SELECT * FROM expert_profiles WHERE chat=? AND (confirmed=1 OR published=1) ORDER BY name',(cid,)).fetchall():
             matches=matching_topics(p['topics'],task['body'])
             if matches:lines.append(f'{p["name"]} (профиль №{p["id"]}): совпадают темы «'+ '», «'.join(matches)+'». '+('Подтверждён экспертом.' if p['confirmed'] else 'По резюме; эксперт не подтвердил.'))
-        emit(db,queue,cid,f'Подбор по тексту задания №{tid}:\n'+('\n'.join(lines) if lines else 'Прямых совпадений с темами опубликованных профилей нет.')+'\nЭто поиск по названиям тем, не оценка квалификации. Вложения в подборе не анализируются. Любой участник чата может взять задание.');return True
+        emit(db,queue,cid,f'Подбор по тексту задания №{tid}:\n'+('\n'.join(lines) if lines else 'Прямых совпадений с темами опубликованных профилей нет.')+'\nСовпадения по темам. Участие открыто всем экспертам.');return True
     return False

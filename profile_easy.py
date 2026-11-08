@@ -74,7 +74,7 @@ def run_cv_once(path,admins,connect,queue,download,extract,generate):
 def public_card(db,queue,p):
     from group_tasks import emit
     label='Подтверждён экспертом' if p['confirmed'] else 'Профиль по резюме, привязан администратором'
-    text=f'{p["name"]}\n{p["role"]}\nТемы: {p["topics"]}\n{label}.\nВладелец может подтвердить одним нажатием. Это не требуется для участия в заданиях.'
+    text=f'{p["name"]}\n{p["role"]}\nТемы: {p["topics"]}\n{label}.'
     buttons=[[('Всё верно',f'epg:ok:{p["id"]}:{p["revision"]}'),('Нужно исправить',f'epg:fix:{p["id"]}:{p["revision"]}')]]
     emit(db,queue,p['chat'],text,buttons)
 
@@ -108,7 +108,7 @@ def handle_easy(db,admins,update,queue):
             else:
                 lid=db.execute('INSERT INTO profile_links(admin,chat,target,name) VALUES(?,?,?,?)',(uid,cid,target['id'],name)).lastrowid
                 choices(db,queue,uid,db.execute('SELECT * FROM profile_links WHERE id=?',(lid,)).fetchone())
-            emit(db,queue,cid,'Выбор профиля отправлен администратору в личный чат бота.');return True
+            emit(db,queue,cid,'Выбор профиля — в личке.');return True
         if cb and cb.get('data','').startswith('epg:'):
             queue(db,'answerCallbackQuery',{'callback_query_id':cb['id'],'text':'Проверяю…'})
             match=re.fullmatch(r'epg:(ok|fix):(\d+):(\d+)',cb['data'])
