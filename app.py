@@ -73,6 +73,8 @@ def initialize(path):
         initialize_review(db)
         initialize_import(db)
         initialize_groups(db)
+        from moderator import initialize_moderator
+        initialize_moderator(db)
         from case_brief import initialize_briefs
         initialize_briefs(db)
         initialize_profiles(db)
@@ -759,6 +761,8 @@ def recover_analysis(path):
     with connect(path) as db:
         from case_brief import recover_briefs
         recover_briefs(db,queue)
+        from moderator import recover_moderator
+        recover_moderator(db,queue)
         for row in db.execute("SELECT * FROM ai_jobs WHERE status='running'").fetchall():
             db.execute("UPDATE ai_jobs SET status='failed',result='Interrupted by restart' WHERE id=?", (row['id'],))
             say(db, row['requested_by'], f'Анализ №{row["proposal_id"]} прерван перезапуском. Для повторной попытки: /analyze {row["proposal_id"]}. Предыдущий запрос мог быть тарифицирован.')
@@ -769,10 +773,12 @@ def analysis_worker(path, admins):
         try:
             from case_brief import run_brief_once
             did_brief = run_brief_once(path, admins)
+            from moderator import run_moderator_once
+            did_moderator = run_moderator_once(path, admins)
             did_cv = run_cv_once(path, admins, connect, queue, download_document, extract_document,
                                   lambda source: generate_analysis(source, os.environ.get('OPENAI_MODEL', 'gpt-6-luna'), CV_INSTRUCTIONS))
             did_document = document_router.run_once(path,admins,connect,queue,download_document,extract_document,generate_analysis,os.environ.get('OPENAI_MODEL','gpt-6-luna'))
-            if not run_analysis_once(path, admins) and not did_cv and not did_brief and not did_document:
+            if not run_analysis_once(path, admins) and not did_cv and not did_brief and not did_document and not did_moderator:
                 time.sleep(1)
         except Exception:
             print('Analysis worker error; no input or secrets logged.', flush=True)

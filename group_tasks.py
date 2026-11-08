@@ -48,6 +48,8 @@ def task_card(db, queue, task, existing=None):
     text+='\n\nПолный текст и файлы — «Материалы и мнения».'
     buttons=[] if task['closed'] else [[('Подключиться',f'g:take:{tid}'),('Представить мнение',f'g:submit:{tid}')]]
     buttons += [[('Подобрать экспертов',f'g:recommend:{tid}')]]
+    buttons += [[('Подготовить справку',f'g:brief:{tid}')]]
+    buttons += [[('Вопросы для обсуждения',f'g:questions:{tid}'),('Подвести итоги',f'g:summary:{tid}')]]
     buttons += [[('Материалы и мнения',f'g:results:{tid}'),('Обновить карточку',f'g:card:{tid}')]]
     if not task['closed']:
         buttons += [[('Завершить обсуждение',f'g:close:{tid}')]]
@@ -160,7 +162,19 @@ def handle_group(db,admins,update,queue):
         task=db.execute('SELECT * FROM council_tasks WHERE id=? AND chat=?',(tid,cid)).fetchone()
         if not task:return True
         member=db.execute('SELECT * FROM council_members WHERE task=? AND uid=?',(tid,uid)).fetchone()
-        if action=='recommend':
+        if action=='brief':
+            if not chair:
+                feedback('Справку запрашивает депутат или администратор.')
+            else:
+                from case_brief import request_brief
+                feedback(request_brief(db,task,uid))
+        elif action in ('questions','summary'):
+            if not chair:
+                feedback('Доступно депутату или администратору.')
+            else:
+                from moderator import request_moderation
+                feedback(request_moderation(db,task,uid,action))
+        elif action=='recommend':
             from expert_profiles import group_profiles
             group_profiles(db,queue,cid,uid,f'/recommend {tid}')
         elif action=='card':task_card(db,queue,task,m)
