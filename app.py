@@ -21,6 +21,7 @@ from meeting_export import build_meeting
 from group_tasks import initialize_groups, handle_group, schedule_groups
 from expert_profiles import initialize_profiles, handle_profiles
 from profile_easy import initialize_easy, handle_easy, run_cv_once, CV_INSTRUCTIONS
+import document_router
 from review_workflow import initialize_review, review_card, review_input
 
 MENU = {'keyboard': [['Подать предложение', 'Мои предложения'], ['О совете', 'Мой ID']], 'resize_keyboard': True}
@@ -72,8 +73,11 @@ def initialize(path):
         initialize_review(db)
         initialize_import(db)
         initialize_groups(db)
+        from case_brief import initialize_briefs
+        initialize_briefs(db)
         initialize_profiles(db)
         initialize_easy(db)
+        document_router.initialize(db)
         columns = {r[1] for r in db.execute('PRAGMA table_info(ai_jobs)')}
         if 'attachments' not in columns:
             db.execute("ALTER TABLE ai_jobs ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'")
@@ -102,6 +106,8 @@ def process(path, admins, update):
         if db.execute('SELECT 1 FROM updates WHERE id=?', (update['update_id'],)).fetchone():
             return
         db.execute('INSERT INTO updates VALUES (?)', (update['update_id'],))
+        if document_router.choose(db, update.get('callback_query') or {}, admins, queue):
+            return
         if handle_easy(db, admins, update, queue):
             return
         if handle_profiles(db, admins, update, queue):
@@ -131,6 +137,9 @@ def process(path, admins, update):
         menu = ADMIN_MENU if uid in admins else MENU
         cmd = text.split()[0].split('@')[0] if text else ''
         draft = db.execute("SELECT * FROM proposals WHERE user_id=? AND status='draft'", (uid,)).fetchone()
+        if not draft and m.get('document') and not db.execute('SELECT 1 FROM expert_uploads WHERE uid=?',(uid,)).fetchone():
+            document_router.prompt(db,uid,m['document'],m.get('caption',''),queue,admins)
+            return
         if review_input(db, uid, admins, text, cmd, draft, m, say, inline):
             return
         if draft and draft['external_id'] and uid not in admins and cmd != '/cancel':
@@ -138,7 +147,7 @@ def process(path, admins, update):
             return
         if cmd in ('/start', '/help'):
             say(db, uid, 'Ғылым — помощник экспертного совета по науке.\n'
-                'Для подачи предложения нажмите «Подать предложение». Ваш Telegram ID, имя, текст и ссылки на файлы будут сохранены и доступны администратору совета. '
+                'Отправьте PDF или Word в личный чат: бот предложит выбрать «Анализ документа», «Предложение» или «Резюме». Анализ документа и создание профиля из резюме доступны администратору. Ваш Telegram ID, имя, текст и ссылки на файлы будут сохранены и доступны администратору совета. '
                 'По запросу администратора текст предложения и извлечённый текст приложенных Word/PDF могут передаваться OpenAI для подготовки проекта справки. Отправляйте только материалы, которыми вправе делиться. Регистрация предложения не означает его одобрения или включения автора в состав совета.\n'
                 '/profile — мой профиль эксперта. /done — отправить предложение; /cancel — удалить черновик; /my — мои предложения; /id — мой ID.\n'
                 + ('Профили: /expert_new, /expert_list, /expert_invite, /expert_resume. Администратор: /today, /overdue, /list [страница], /view НОМЕР, /status НОМЕР new|review|done, /summary, /export, /import, /meeting НОМЕРА, /sources НОМЕР, /analyze НОМЕР (текст заявки и Word/PDF будут переданы OpenAI).' if uid in admins else ''), menu)
@@ -420,12 +429,15 @@ def reminder_worker(path, admins):
 
 
 def deliver_item(token, method, payload, admins):
-    if method not in ('uploadRegistry', 'uploadMeeting'):
+    if method not in ('uploadRegistry', 'uploadMeeting', 'uploadCase'):
         return api(token, method, {k:v for k,v in payload.items() if not k.startswith('_council')})
-    if payload.get('chat_id') not in admins:
+    if method=='uploadCase' and not payload.get('_council'):
+        return {'ok': False, 'error_code': 403}
+    if method!='uploadCase' and payload.get('chat_id') not in admins:
         return {'ok': False, 'error_code': 403}
     filename = 'science-meeting.docx' if method == 'uploadMeeting' else 'science-registry.xlsx'
-    mime = 'application/vnd.openxmlformats-officedocument.' + ('wordprocessingml.document' if method == 'uploadMeeting' else 'spreadsheetml.sheet')
+    if method=='uploadCase':filename=f'case-{int(payload["task"])}-brief.docx'
+    mime = 'application/vnd.openxmlformats-officedocument.' + ('wordprocessingml.document' if method in ('uploadMeeting','uploadCase') else 'spreadsheetml.sheet')
     boundary = 'Science' + uuid.uuid4().hex
     data = base64.b64decode(payload['data'])
     body = (f'--{boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n{payload["chat_id"]}\r\n'
@@ -487,6 +499,9 @@ def deliver(path, token, admins):
                 code = result.get('error_code', 503)
                 delay = max(result.get('parameters', {}).get('retry_after', 0), min(300, 2 ** min(row['attempts'] + 1, 8)))
                 state = 'failed' if code in (400, 401, 403, 404) else 'pending'
+                if row['method']=='uploadCase' and state=='failed':
+                    from group_tasks import emit
+                    emit(db,queue,payload['chat_id'],'Не удалось отправить справку Word. Проверьте право бота отправлять документы и повторите подготовку справки.')
                 db.execute('UPDATE outbox SET attempts=attempts+1,next_try=?,state=? WHERE id=?', (time.time() + delay, state, row['id']))
                 if row['method'] in ('uploadRegistry', 'uploadMeeting') and state == 'failed':
                     recipient = json.loads(row['payload']).get('chat_id')
@@ -742,6 +757,8 @@ def run_analysis_once(path, admins, generate=generate_analysis):
 
 def recover_analysis(path):
     with connect(path) as db:
+        from case_brief import recover_briefs
+        recover_briefs(db,queue)
         for row in db.execute("SELECT * FROM ai_jobs WHERE status='running'").fetchall():
             db.execute("UPDATE ai_jobs SET status='failed',result='Interrupted by restart' WHERE id=?", (row['id'],))
             say(db, row['requested_by'], f'Анализ №{row["proposal_id"]} прерван перезапуском. Для повторной попытки: /analyze {row["proposal_id"]}. Предыдущий запрос мог быть тарифицирован.')
@@ -750,9 +767,12 @@ def recover_analysis(path):
 def analysis_worker(path, admins):
     while True:
         try:
+            from case_brief import run_brief_once
+            did_brief = run_brief_once(path, admins)
             did_cv = run_cv_once(path, admins, connect, queue, download_document, extract_document,
                                   lambda source: generate_analysis(source, os.environ.get('OPENAI_MODEL', 'gpt-6-luna'), CV_INSTRUCTIONS))
-            if not run_analysis_once(path, admins) and not did_cv:
+            did_document = document_router.run_once(path,admins,connect,queue,download_document,extract_document,generate_analysis,os.environ.get('OPENAI_MODEL','gpt-6-luna'))
+            if not run_analysis_once(path, admins) and not did_cv and not did_brief and not did_document:
                 time.sleep(1)
         except Exception:
             print('Analysis worker error; no input or secrets logged.', flush=True)
@@ -782,6 +802,10 @@ def main():
     if not result.get('ok'):
         raise SystemExit('Webhook registration failed. Check token, service URL and Telegram availability.')
     recover_analysis(path)
+    with connect(path) as db:
+        for job in db.execute("SELECT * FROM document_analysis WHERE state='running'"):
+            db.execute("UPDATE document_analysis SET state='failed',result='Прервано перезапуском' WHERE id=?",(job['id'],))
+            say(db,job['uid'],'Анализ документа прерван перезапуском. Повторно отправьте файл.')
     with connect(path) as db:
         for job in db.execute("SELECT * FROM cv_jobs WHERE status='running'").fetchall():
             db.execute("UPDATE cv_jobs SET status='failed',error='Прервано перезапуском' WHERE id=?", (job['id'],))

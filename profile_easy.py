@@ -156,14 +156,4 @@ def handle_easy(db,admins,update,queue):
             p=db.execute('SELECT * FROM expert_profiles WHERE id=?',(b,)).fetchone()
             public_card(db,queue,p);send(db,queue,uid,'Профиль привязан. Эксперту не нужны команды: он может подтвердить карточку прямо в группе.')
         return True
-    # Existing document flows take precedence over automatic CV intake.
-    if uid in admins and not cb and m.get('document'):
-        if db.execute("SELECT 1 FROM proposals WHERE user_id=? AND status='draft'",(uid,)).fetchone() or db.execute('SELECT 1 FROM expert_uploads WHERE uid=?',(uid,)).fetchone():return False
-        doc=m['document'];name=doc.get('file_name','')
-        if not name.lower().endswith(('.pdf','.docx')):send(db,queue,uid,'Для профиля отправьте резюме в PDF с текстовым слоем или Word .docx.');return True
-        if doc.get('file_size',0)>10*1024*1024:send(db,queue,uid,'Резюме должно быть не больше 10 МБ.');return True
-        prior=db.execute("SELECT * FROM cv_jobs WHERE uid=? AND file_id=? AND status IN ('pending','running','done')",(uid,doc['file_id'])).fetchone()
-        if prior:send(db,queue,uid,f'Этот файл уже обработан: профиль №{prior["profile"]}.' if prior['status']=='done' else 'Это резюме уже обрабатывается.');return True
-        db.execute('INSERT INTO cv_jobs(uid,file_id,name) VALUES(?,?,?)',(uid,doc['file_id'],name))
-        send(db,queue,uid,'Готовлю черновик профиля по резюме. Текст будет передан OpenAI; оригинал и контакты не публикуются в группе. Карточка придёт сюда для вашей проверки.');return True
     return False
