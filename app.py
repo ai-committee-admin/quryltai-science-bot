@@ -18,6 +18,8 @@ from documents import extract_document, MAX_BYTES
 from registry_export import build_registry
 from site_import import initialize_import, start_import
 from meeting_export import build_meeting
+from group_tasks import initialize_groups, handle_group, schedule_groups
+from expert_profiles import initialize_profiles, handle_profiles
 from review_workflow import initialize_review, review_card, review_input
 
 MENU = {'keyboard': [['Подать предложение', 'Мои предложения'], ['О совете', 'Мой ID']], 'resize_keyboard': True}
@@ -68,6 +70,8 @@ def initialize(path):
         """)
         initialize_review(db)
         initialize_import(db)
+        initialize_groups(db)
+        initialize_profiles(db)
         columns = {r[1] for r in db.execute('PRAGMA table_info(ai_jobs)')}
         if 'attachments' not in columns:
             db.execute("ALTER TABLE ai_jobs ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'")
@@ -96,6 +100,10 @@ def process(path, admins, update):
         if db.execute('SELECT 1 FROM updates WHERE id=?', (update['update_id'],)).fetchone():
             return
         db.execute('INSERT INTO updates VALUES (?)', (update['update_id'],))
+        if handle_profiles(db, admins, update, queue):
+            return
+        if handle_group(db, admins, update, queue):
+            return
         m = update.get('message') or {}
         callback = update.get('callback_query')
         if isinstance(callback, dict):
@@ -128,8 +136,8 @@ def process(path, admins, update):
             say(db, uid, 'Ғылым — помощник экспертного совета по науке.\n'
                 'Для подачи предложения нажмите «Подать предложение». Ваш Telegram ID, имя, текст и ссылки на файлы будут сохранены и доступны администратору совета. '
                 'По запросу администратора текст предложения и извлечённый текст приложенных Word/PDF могут передаваться OpenAI для подготовки проекта справки. Отправляйте только материалы, которыми вправе делиться. Регистрация предложения не означает его одобрения или включения автора в состав совета.\n'
-                '/done — отправить предложение; /cancel — удалить черновик; /my — мои предложения; /id — мой ID.\n'
-                + ('Администратор: /today, /overdue, /list [страница], /view НОМЕР, /status НОМЕР new|review|done, /summary, /export, /import, /meeting НОМЕРА, /sources НОМЕР, /analyze НОМЕР (текст заявки и Word/PDF будут переданы OpenAI).' if uid in admins else ''), menu)
+                '/profile — мой профиль эксперта. /done — отправить предложение; /cancel — удалить черновик; /my — мои предложения; /id — мой ID.\n'
+                + ('Профили: /expert_new, /expert_list, /expert_invite, /expert_resume. Администратор: /today, /overdue, /list [страница], /view НОМЕР, /status НОМЕР new|review|done, /summary, /export, /import, /meeting НОМЕРА, /sources НОМЕР, /analyze НОМЕР (текст заявки и Word/PDF будут переданы OpenAI).' if uid in admins else ''), menu)
         elif cmd == '/id' or text == 'Мой ID':
             say(db, uid, f'Ваш Telegram ID: {uid}')
         elif cmd == '/about' or text == 'О совете':
@@ -368,6 +376,7 @@ def schedule_digest_once(path, admins, now=None):
     day = now.date().isoformat()
     with connect(path) as db:
         db.execute('BEGIN IMMEDIATE')
+        schedule_groups(db, queue, now)
         today_count, overdue_count = deadline_counts(db, day)
         for row in db.execute('SELECT user_id FROM reminder_settings WHERE enabled=1').fetchall():
             uid = row['user_id']
@@ -408,7 +417,7 @@ def reminder_worker(path, admins):
 
 def deliver_item(token, method, payload, admins):
     if method not in ('uploadRegistry', 'uploadMeeting'):
-        return api(token, method, payload)
+        return api(token, method, {k:v for k,v in payload.items() if not k.startswith('_council')})
     if payload.get('chat_id') not in admins:
         return {'ok': False, 'error_code': 403}
     filename = 'science-meeting.docx' if method == 'uploadMeeting' else 'science-registry.xlsx'
@@ -455,12 +464,20 @@ def deliver(path, token, admins):
             time.sleep(1)
             continue
         payload = json.loads(row['payload'])
-        result = deliver_digest(path, token, payload, admins) if row['method'] == 'deadlineDigest' else deliver_item(token, row['method'], payload, admins)
+        disabled = False
+        if payload.get('_council'):
+            with connect(path) as db:
+                group = db.execute('SELECT enabled FROM council_groups WHERE chat=?', (payload.get('chat_id'),)).fetchone()
+                disabled = not group or not group[0]
+        result = {'ok': True, 'skipped': True} if disabled else (deliver_digest(path, token, payload, admins) if row['method'] == 'deadlineDigest' else deliver_item(token, row['method'], payload, admins))
         with connect(path) as db:
             if row['method'] == 'deadlineDigest' and not payload.get('test'):
                 state = ('skipped' if result.get('skipped') else 'sent') if result.get('ok') else ('failed' if result.get('error_code') in (400, 401, 403, 404) else 'queued')
                 db.execute('UPDATE reminder_days SET state=? WHERE user_id=? AND day=?', (state, payload['chat_id'], payload['day']))
             if result.get('ok'):
+                sent_id = (result.get('result') or {}).get('message_id') if isinstance(result.get('result'), dict) else None
+                if sent_id and payload.get('_council_task'):
+                    db.execute('INSERT OR IGNORE INTO council_links VALUES(?,?,?)', (payload['chat_id'], sent_id, payload['_council_task']))
                 db.execute('DELETE FROM outbox WHERE id=?', (row['id'],))
             else:
                 code = result.get('error_code', 503)
