@@ -3,7 +3,7 @@ services:
     name: quryltai-science-bot
     runtime: python
     plan: starter
-    buildCommand: pip install -r requirements.txt && python -m compileall -q app.py documents.py registry_export.py review_workflow.py meeting_export.py site_import.py group_tasks.py expert_profiles.py
+    buildCommand: pip install -r requirements.txt && python -m compileall -q app.py documents.py registry_export.py review_workflow.py meeting_export.py site_import.py group_tasks.py expert_profiles.py profile_easy.py
     startCommand: python app.py
     healthCheckPath: /health
     disk:

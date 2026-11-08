@@ -20,6 +20,7 @@ from site_import import initialize_import, start_import
 from meeting_export import build_meeting
 from group_tasks import initialize_groups, handle_group, schedule_groups
 from expert_profiles import initialize_profiles, handle_profiles
+from profile_easy import initialize_easy, handle_easy, run_cv_once, CV_INSTRUCTIONS
 from review_workflow import initialize_review, review_card, review_input
 
 MENU = {'keyboard': [['Подать предложение', 'Мои предложения'], ['О совете', 'Мой ID']], 'resize_keyboard': True}
@@ -72,6 +73,7 @@ def initialize(path):
         initialize_import(db)
         initialize_groups(db)
         initialize_profiles(db)
+        initialize_easy(db)
         columns = {r[1] for r in db.execute('PRAGMA table_info(ai_jobs)')}
         if 'attachments' not in columns:
             db.execute("ALTER TABLE ai_jobs ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'")
@@ -100,6 +102,8 @@ def process(path, admins, update):
         if db.execute('SELECT 1 FROM updates WHERE id=?', (update['update_id'],)).fetchone():
             return
         db.execute('INSERT INTO updates VALUES (?)', (update['update_id'],))
+        if handle_easy(db, admins, update, queue):
+            return
         if handle_profiles(db, admins, update, queue):
             return
         if handle_group(db, admins, update, queue):
@@ -599,13 +603,13 @@ class AnalysisError(Exception):
     pass
 
 
-def generate_analysis(source, model):
+def generate_analysis(source, model, instructions=None):
     key = os.environ.get('OPENAI_API_KEY', '').strip()
     if not key:
         raise AnalysisError('Не задан OPENAI_API_KEY в Render.')
     numbered = '\n'.join(f'[А{i}] {paragraph}' for i, paragraph in enumerate((p.strip() for p in source.splitlines() if p.strip()), 1))
-    payload = {'model': model, 'instructions': AI_INSTRUCTIONS,
-               'input': [{'role': 'user', 'content': 'Исходный текст предложения:\n' + numbered}],
+    payload = {'model': model, 'instructions': instructions or AI_INSTRUCTIONS,
+               'input': [{'role': 'user', 'content': ('Исходный текст документа:\n' if instructions else 'Исходный текст предложения:\n') + numbered}],
                'max_output_tokens': 4000, 'store': False}
     req = urllib.request.Request('https://api.openai.com/v1/responses',
         data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key})
@@ -746,7 +750,9 @@ def recover_analysis(path):
 def analysis_worker(path, admins):
     while True:
         try:
-            if not run_analysis_once(path, admins):
+            did_cv = run_cv_once(path, admins, connect, queue, download_document, extract_document,
+                                  lambda source: generate_analysis(source, os.environ.get('OPENAI_MODEL', 'gpt-6-luna'), CV_INSTRUCTIONS))
+            if not run_analysis_once(path, admins) and not did_cv:
                 time.sleep(1)
         except Exception:
             print('Analysis worker error; no input or secrets logged.', flush=True)
@@ -776,6 +782,10 @@ def main():
     if not result.get('ok'):
         raise SystemExit('Webhook registration failed. Check token, service URL and Telegram availability.')
     recover_analysis(path)
+    with connect(path) as db:
+        for job in db.execute("SELECT * FROM cv_jobs WHERE status='running'").fetchall():
+            db.execute("UPDATE cv_jobs SET status='failed',error='Прервано перезапуском' WHERE id=?", (job['id'],))
+            say(db, job['uid'], 'Обработка резюме прервана перезапуском. Отправьте файл повторно; предыдущий запрос мог быть тарифицирован.')
     threading.Thread(target=analysis_worker, args=(path, admins), daemon=True).start()
     threading.Thread(target=deliver, args=(path, token, admins), daemon=True).start()
     threading.Thread(target=reminder_worker, args=(path, admins), daemon=True).start()

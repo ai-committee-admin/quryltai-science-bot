@@ -31,12 +31,12 @@ def send(db,queue,uid,text,buttons=()):
 
 
 def profile_text(p,private=False):
-    text=f'Профиль №{p["id"]} · '+('Подтверждён экспертом' if p['confirmed'] else 'Черновик — не подтверждён')
+    text=f'Профиль №{p["id"]} · '+('Подтверждён экспертом' if p['confirmed'] else ('По резюме, привязан администратором' if p['published'] else 'Черновик — не подтверждён'))
     for key,label in FIELDS.items():text+=f'\n\n{label}: {p[key]}'
     text+='\n\nСведения по резюме и подтверждению владельца. Независимая проверка квалификации не проводилась.'
     if private:
         text+=f'\nРезюме: {p["source_name"] or "не прикреплено"}\nЧат совета: {p["chat"] or "не назначен"}\nОбновлён: {p["updated"]} UTC.'
-        text+='\nПосле подтверждения ФИО, должность, темы, опыт и образование будут доступны участникам указанного чата. Исходное резюме остаётся в личном доступе эксперта и администраторов бота.'
+        text+='\nПри публикации администратором или подтверждении владельцем ФИО, должность, темы, опыт и образование доступны участникам указанного чата. Исходное резюме остаётся в личном доступе эксперта и администраторов бота.'
     return text
 
 
@@ -61,7 +61,7 @@ def handle_profiles(db,admins,update,queue):
         if action=='edit':
             send(db,queue,uid,f'Для изменения отправьте /profile_edit {pid} topics | Новые темы через запятую\nПоля: name, role, topics, experience, education. После правки подтвердите профиль повторно.');return True
         if action=='hide':
-            db.execute('UPDATE expert_profiles SET confirmed=0,revision=revision+1 WHERE id=?',(pid,));send(db,queue,uid,'Профиль скрыт из списка и подбора. Ваши задания сохранены.');return True
+            db.execute('UPDATE expert_profiles SET confirmed=0,published=0,revision=revision+1 WHERE id=?',(pid,));send(db,queue,uid,'Профиль скрыт из списка и подбора. Ваши задания сохранены.');return True
         enabled=db.execute('SELECT enabled FROM council_groups WHERE chat=?',(p['chat'],)).fetchone()
         if p['revision']!=int(rev) or not enabled or not enabled[0]:
             send(db,queue,uid,'Карточка изменилась или чат отключён. Откройте /profile для актуальной версии.');return True
@@ -87,7 +87,7 @@ def handle_profiles(db,admins,update,queue):
         p=db.execute('SELECT * FROM expert_profiles WHERE id=?',(pid,)).fetchone()
         if not p or (uid not in admins and p['target']!=uid):send(db,queue,uid,'Нет доступа к этому профилю.');return True
         if not 1<=len(value)<=1500:send(db,queue,uid,'Поле должно содержать от 1 до 1500 символов.');return True
-        db.execute(f'UPDATE expert_profiles SET {field}=?,confirmed=0,revision=revision+1,updated=CURRENT_TIMESTAMP WHERE id=?',(value,pid))
+        db.execute(f'UPDATE expert_profiles SET {field}=?,confirmed=0,published=0,revision=revision+1,updated=CURRENT_TIMESTAMP WHERE id=?',(value,pid))
         p=db.execute('SELECT * FROM expert_profiles WHERE id=?',(pid,)).fetchone()
         if uid==p['target']:review(db,queue,uid,p)
         else:send(db,queue,uid,'Изменение сохранено. Профиль скрыт до повторного подтверждения экспертом через /profile.')
@@ -147,7 +147,7 @@ def handle_profiles(db,admins,update,queue):
             db.execute('DELETE FROM expert_uploads WHERE uid=?',(uid,));send(db,queue,uid,'Права администратора отозваны.');return True
         doc=m.get('document') or {}
         if not doc.get('file_id'):send(db,queue,uid,'Ожидаю резюме как документ. /cancel_profile — отменить.');return True
-        db.execute('UPDATE expert_profiles SET source_file=?,source_name=?,confirmed=0,revision=revision+1,updated=CURRENT_TIMESTAMP WHERE id=?',(doc['file_id'],doc.get('file_name','Резюме'),pending[0]))
+        db.execute('UPDATE expert_profiles SET source_file=?,source_name=?,confirmed=0,published=0,revision=revision+1,updated=CURRENT_TIMESTAMP WHERE id=?',(doc['file_id'],doc.get('file_name','Резюме'),pending[0]))
         db.execute('DELETE FROM expert_uploads WHERE uid=?',(uid,));send(db,queue,uid,'Резюме прикреплено. Сведения профиля требуют подтверждения экспертом.');return True
     return False
 
@@ -164,19 +164,19 @@ def group_profiles(db,queue,cid,uid,text):
     if cmd=='/groupid':emit(db,queue,cid,f'ID этого чата: {cid}');return True
     if cmd=='/experts':
         offset=int(parts[1]) if len(parts)==2 and parts[1].isdigit() else 0
-        rows=db.execute('SELECT * FROM expert_profiles WHERE chat=? AND confirmed=1 ORDER BY name LIMIT 10 OFFSET ?',(cid,offset)).fetchall()
-        emit(db,queue,cid,('Подтверждённые профили:\n'+'\n\n'.join(f'№{p["id"]} · {p["name"]}\n{p["role"]}\nТемы: {p["topics"]}' for p in rows) if rows else 'Подтверждённых профилей пока нет.')+f'\n/experts {offset+10} — следующая страница. /expert НОМЕР — карточка.');return True
+        rows=db.execute('SELECT * FROM expert_profiles WHERE chat=? AND (confirmed=1 OR published=1) ORDER BY name LIMIT 10 OFFSET ?',(cid,offset)).fetchall()
+        emit(db,queue,cid,('Профили экспертов:\n'+'\n\n'.join(f'№{p["id"]} · {p["name"]}\n{p["role"]}\nТемы: {p["topics"]} · Подтверждение эксперта: {"да" if p["confirmed"] else "нет, сведения по резюме"}' for p in rows) if rows else 'Опубликованных профилей пока нет.')+f'\n/experts {offset+10} — следующая страница. /expert НОМЕР — карточка.');return True
     if cmd=='/expert':
         pid=parts[1] if len(parts)==2 and parts[1].isdigit() else None
-        p=db.execute('SELECT * FROM expert_profiles WHERE id=? AND chat=? AND confirmed=1',(pid,cid)).fetchone()
-        emit(db,queue,cid,profile_text(p) if p else 'Подтверждённый профиль в этом чате не найден.');return True
+        p=db.execute('SELECT * FROM expert_profiles WHERE id=? AND chat=? AND (confirmed=1 OR published=1)',(pid,cid)).fetchone()
+        emit(db,queue,cid,profile_text(p) if p else 'Опубликованный профиль в этом чате не найден.');return True
     if cmd=='/recommend':
         tid=parts[1] if len(parts)==2 and parts[1].isdigit() else None
         task=db.execute('SELECT * FROM council_tasks WHERE id=? AND chat=?',(tid,cid)).fetchone()
         if not task:emit(db,queue,cid,'Формат: /recommend НОМЕР_ЗАДАНИЯ');return True
         lines=[]
-        for p in db.execute('SELECT * FROM expert_profiles WHERE chat=? AND confirmed=1 ORDER BY name',(cid,)).fetchall():
+        for p in db.execute('SELECT * FROM expert_profiles WHERE chat=? AND (confirmed=1 OR published=1) ORDER BY name',(cid,)).fetchall():
             matches=matching_topics(p['topics'],task['body'])
-            if matches:lines.append(f'{p["name"]} (профиль №{p["id"]}): совпадают темы «'+ '», «'.join(matches)+'».')
-        emit(db,queue,cid,f'Подбор по тексту задания №{tid}:\n'+('\n'.join(lines) if lines else 'Прямых совпадений с подтверждёнными темами нет.')+'\nЭто поиск по названиям тем, не оценка квалификации. Вложения в подборе не анализируются. Любой участник чата может взять задание.');return True
+            if matches:lines.append(f'{p["name"]} (профиль №{p["id"]}): совпадают темы «'+ '», «'.join(matches)+'». '+('Подтверждён экспертом.' if p['confirmed'] else 'По резюме; эксперт не подтвердил.'))
+        emit(db,queue,cid,f'Подбор по тексту задания №{tid}:\n'+('\n'.join(lines) if lines else 'Прямых совпадений с темами опубликованных профилей нет.')+'\nЭто поиск по названиям тем, не оценка квалификации. Вложения в подборе не анализируются. Любой участник чата может взять задание.');return True
     return False
