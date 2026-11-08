@@ -40,8 +40,12 @@ def is_chair(db, chat, uid, admins):
 def task_card(db, queue, task, existing=None):
     members = db.execute('SELECT * FROM council_members WHERE task=? ORDER BY uid',(task['id'],)).fetchall()
     tid=task['id']
-    text=f'Кейс №{tid} · ' + ('Обсуждение завершено' if task['closed'] else 'Обсуждение открыто') + '\n' + task['body'] + '\nМнения до: ' + (task['deadline'] or 'дата не указана')
-    text+='\n\n' + ('\n'.join(f'{r["name"]}: {STATES[r["state"]]}' for r in members) or 'Участников пока нет.')
+    # Keep one card with its buttons. The unabridged source remains in materials.
+    preview=task['body'][:700] + ('…' if len(task['body'])>700 else '')
+    text=f'Кейс №{tid} · ' + ('Обсуждение завершено' if task['closed'] else 'Обсуждение открыто') + '\n' + preview + '\nМнения до: ' + (task['deadline'] or 'дата не указана')
+    text+='\n\n' + ('\n'.join(f'{r["name"][:50]}: {STATES[r["state"]]}' for r in members[:6]) or 'Участников пока нет.')
+    if len(members)>6:text+=f'\nВсего участников: {len(members)}.'
+    text+='\n\nПолный текст и файлы — «Материалы и мнения».'
     buttons=[] if task['closed'] else [[('Подключиться',f'g:take:{tid}'),('Представить мнение',f'g:submit:{tid}')]]
     buttons += [[('Подобрать экспертов',f'g:recommend:{tid}')]]
     buttons += [[('Материалы и мнения',f'g:results:{tid}'),('Обновить карточку',f'g:card:{tid}')]]
@@ -104,7 +108,7 @@ def handle_group(db,admins,update,queue):
     cid=chat['id'];actor=(cb or {}).get('from') if cb else m.get('from');actor=actor or {};uid=actor.get('id')
     if not isinstance(uid,int) or actor.get('is_bot') or m.get('sender_chat'):
         return True
-    text=(m.get('text') or '').strip();parts=text.split();cmd=parts[0].split('@')[0] if parts else ''
+    text=(m.get('text') or m.get('caption') or '').strip();parts=text.split();cmd=parts[0].split('@')[0] if parts else ''
     cmd={'/case':'/task','/cases':'/tasks'}.get(cmd,cmd)
     if not cb and cmd in ('/council_on','/council_off') and uid in admins:
         db.execute('INSERT INTO council_groups VALUES(?,?) ON CONFLICT(chat) DO UPDATE SET enabled=excluded.enabled',(cid,int(cmd=='/council_on')))
@@ -217,6 +221,8 @@ def handle_group(db,admins,update,queue):
     deliberate_attach = cmd=='/attach'
     if deliberate_task or deliberate_attach:
         original=m.get('reply_to_message') if cmd in ('/task','/attach') else m
+        if not original and cmd=='/task' and m.get('document'):
+            original=m
         if not original and cmd=='/task' and len(parts)>1:
             original=dict(m,text=text.split(None,1)[1])
         if not original or not original.get('message_id') or not (original.get('text') or original.get('document')):
