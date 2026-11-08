@@ -158,6 +158,37 @@ def matching_topics(topics,body):
     return [tag.strip() for tag in topics.split(',') if len(tag.strip())>1 and re.search(r'(?<!\w)'+re.escape(' '.join(tag.strip().casefold().replace('ё','е').split()))+r'(?!\w)',body)]
 
 
+
+# A conservative lexical fallback: all significant words in a multi-word topic
+# must be present. This is not a claim that a person's qualification is verified.
+_TOPIC_STOPWORDS = {'и','или','для','по','в','на','с','со','из','при','об','о','от','до','к','а','the','and','of','for'}
+
+def _topic_words(value):
+    return [w for w in re.findall(r'[^\W_]+',value.casefold().replace('ё','е')) if len(w)>=4 and w not in _TOPIC_STOPWORDS]
+
+def _topic_root(word):
+    # Only use a loose root for long words to recognize ordinary inflection.
+    # Avoid false positives on short abbreviations and technical terms.
+    return word[:max(5,len(word)-3)] if len(word)>=8 else word
+
+def topic_matches(topics,body):
+    """Return (exact phrases, non-adjacent lexical overlaps), based on declared topics only."""
+    exact=matching_topics(topics,body)
+    body_words=set(_topic_words(body))
+    body_roots={_topic_root(w) for w in body_words}
+    related=[]
+    for tag in topics.split(','):
+        tag=tag.strip()
+        if not tag or tag in exact:continue
+        words=_topic_words(tag)
+        if len(words)<2:continue
+        # Every significant topic word must match; never treat a single
+        # broad word such as "наука" as a verified competence.
+        if all(w in body_words or _topic_root(w) in body_roots for w in words):
+            related.append(tag)
+    return exact,related
+
+
 def group_profiles(db,queue,cid,uid,text):
     from group_tasks import emit
     parts=text.split();cmd=parts[0].split('@')[0] if parts else ''
@@ -174,9 +205,18 @@ def group_profiles(db,queue,cid,uid,text):
         tid=parts[1] if len(parts)==2 and parts[1].isdigit() else None
         task=db.execute('SELECT * FROM council_tasks WHERE id=? AND chat=?',(tid,cid)).fetchone()
         if not task:emit(db,queue,cid,'Формат: /recommend НОМЕР_КЕЙСА');return True
-        lines=[]
+        matches_by_profile=[]
         for p in db.execute('SELECT * FROM expert_profiles WHERE chat=? AND (confirmed=1 OR published=1) ORDER BY name',(cid,)).fetchall():
-            matches=matching_topics(p['topics'],task['body'])
-            if matches:lines.append(f'{p["name"]} (профиль №{p["id"]}): совпадают темы «'+ '», «'.join(matches)+'». '+('Подтверждён экспертом.' if p['confirmed'] else 'По резюме; эксперт не подтвердил.'))
-        emit(db,queue,cid,f'Подбор по теме кейса №{tid}:\n'+('\n'.join(lines) if lines else 'Прямых совпадений с темами опубликованных профилей нет.')+'\nСовпадения по темам. Участие открыто всем экспертам.');return True
+            exact,related=topic_matches(p['topics'],task['body'])
+            if not (exact or related):continue
+            score=(bool(exact),len(exact),len(related))
+            reasons=[]
+            if exact:reasons.append('совпадают темы: '+', '.join(exact[:3]))
+            if related:reasons.append('совпадение ключевых слов: '+', '.join(related[:3]))
+            status='подтверждён экспертом' if p['confirmed'] else 'по резюме, без подтверждения экспертом'
+            matches_by_profile.append((score,f'№{p["id"]} · {p["name"]} — {"; ".join(reasons)} ({status})'))
+        matches_by_profile.sort(key=lambda item:item[0],reverse=True)
+        lines=[item[1] for item in matches_by_profile[:5]]
+        if len(matches_by_profile)>5:lines.append(f'Ещё профилей с совпадениями: {len(matches_by_profile)-5}. Для просмотра всех — /experts.')
+        emit(db,queue,cid,f'Подбор по теме кейса №{tid}:\n'+('\n'.join(lines) if lines else 'Совпадений с темами опубликованных профилей нет.')+'\nПодбор ориентировочный: только по указанным темам, без проверки квалификации. Никто не назначен автоматически.');return True
     return False
