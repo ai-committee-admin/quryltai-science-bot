@@ -25,6 +25,8 @@ def initialize_moderator(db):
 
 
 def request_moderation(db, task, uid, kind):
+    if task['archived']:
+        return 'Кейс в архиве.'
     if kind not in ('questions','summary'):
         return 'Неизвестное действие.'
     if db.execute("SELECT 1 FROM moderator_jobs WHERE task=? AND state IN ('pending','running')", (task['id'],)).fetchone():

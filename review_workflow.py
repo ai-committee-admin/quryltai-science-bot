@@ -62,7 +62,7 @@ def review_input(db, uid, admins, text, cmd, draft, message, say, inline):
         if not valid or (cmd == '/edit' and args[2] not in FIELDS):
             say(db, uid, 'Откройте заявку и нажмите нужную кнопку. Команда: /edit НОМЕР topic|assignee|deadline|comment|outcome или /history НОМЕР.')
             return True
-        row = db.execute("SELECT * FROM proposals WHERE id=? AND status!='draft'", (int(args[1]),)).fetchone()
+        row = db.execute("SELECT * FROM proposals WHERE id=? AND status NOT IN ('draft','archived')", (int(args[1]),)).fetchone()
         if not row:
             say(db, uid, 'Зарегистрированная заявка не найдена.')
             return True

@@ -42,7 +42,7 @@ def build_meeting(db, ids, statuses):
         raise ValueError('Укажите от 1 до 10 разных номеров: /meeting 1 2')
     records = []
     for pid in ids:
-        row = db.execute("SELECT * FROM proposals WHERE id=? AND status!='draft'", (pid,)).fetchone()
+        row = db.execute("SELECT * FROM proposals WHERE id=? AND status NOT IN ('draft','archived')", (pid,)).fetchone()
         if not row:
             raise ValueError(f'Заявка №{pid} не найдена или ещё не отправлена. Пакет не создан.')
         ai = db.execute("SELECT * FROM ai_jobs WHERE proposal_id=? AND status IN ('done','partial') ORDER BY id DESC LIMIT 1", (pid,)).fetchone()

@@ -27,7 +27,7 @@ from review_workflow import initialize_review, review_card, review_input
 MENU = {'keyboard': [['Подать предложение', 'Мои предложения'], ['О совете', 'Мой ID']], 'resize_keyboard': True}
 ADMIN_MENU = {'keyboard': [['Новые заявки', 'Все заявки'], ['Срок сегодня', 'Просрочено'], ['Сводка', 'Выгрузить Excel'], ['Напоминания', 'Материалы Word'], ['Импорт с сайта'], ['Подать предложение', 'Мои предложения'], ['О совете', 'Мой ID']], 'resize_keyboard': True}
 ADMIN_ACTIONS = {'Импорт с сайта': '/import', 'Материалы Word': '/meeting', 'Напоминания': '/reminders', 'Срок сегодня': '/today', 'Просрочено': '/overdue', 'Новые заявки': '/inbox', 'Все заявки': '/list', 'Сводка': '/summary', 'Выгрузить Excel': '/export'}
-STATUSES = {'new': 'Получено', 'review': 'На рассмотрении', 'done': 'Рассмотрено'}
+STATUSES = {'new': 'Получено', 'review': 'На рассмотрении', 'done': 'Рассмотрено', 'archived': 'В архиве'}
 
 
 def connect(path):
@@ -80,6 +80,9 @@ def initialize(path):
         initialize_profiles(db)
         initialize_easy(db)
         document_router.initialize(db)
+        proposal_cols = {c[1] for c in db.execute('PRAGMA table_info(proposals)')}
+        if 'archived_previous_status' not in proposal_cols:
+            db.execute("ALTER TABLE proposals ADD COLUMN archived_previous_status TEXT NOT NULL DEFAULT 'new'")
         columns = {r[1] for r in db.execute('PRAGMA table_info(ai_jobs)')}
         if 'attachments' not in columns:
             db.execute("ALTER TABLE ai_jobs ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'")
@@ -123,7 +126,7 @@ def process(path, admins, update):
             chat = (callback.get('message') or {}).get('chat') or {}
             data = callback.get('data', '')
             permitted = actor.get('id') in admins and not actor.get('is_bot') and chat.get('type') == 'private' and chat.get('id') == actor.get('id')
-            valid = isinstance(data, str) and re.fullmatch(r'/(?:(?:list|inbox|today|overdue|view|analyze|sources|history) [1-9][0-9]{0,12}|edit [1-9][0-9]{0,12} (?:topic|assignee|deadline|comment|outcome))', data)
+            valid = isinstance(data, str) and re.fullmatch(r'/(?:(?:list|inbox|today|overdue|view|analyze|sources|history|archive|archiveconfirm|restore) [1-9][0-9]{0,12}|edit [1-9][0-9]{0,12} (?:topic|assignee|deadline|comment|outcome))', data)
             queue(db, 'answerCallbackQuery', {'callback_query_id': callback.get('id', ''), 'text': 'Открываю…' if permitted and valid else 'Кнопка недоступна.'})
             if not permitted or not valid:
                 return
@@ -152,7 +155,7 @@ def process(path, admins, update):
                 'Отправьте PDF или Word в личный чат: бот предложит выбрать «Анализ документа», «Предложение» или «Резюме». Анализ документа и создание профиля из резюме доступны администратору. Ваш Telegram ID, имя, текст и ссылки на файлы будут сохранены и доступны администратору совета. '
                 'По запросу администратора текст предложения и извлечённый текст приложенных Word/PDF могут передаваться OpenAI для подготовки проекта справки. Отправляйте только материалы, которыми вправе делиться. Регистрация предложения не означает его одобрения или включения автора в состав совета.\n'
                 '/profile — мой профиль эксперта. /done — отправить предложение; /cancel — удалить черновик; /my — мои предложения; /id — мой ID.\n'
-                + ('Профили: /expert_new, /expert_list, /expert_invite, /expert_resume. Администратор: /today, /overdue, /list [страница], /view НОМЕР, /status НОМЕР new|review|done, /summary, /export, /import, /meeting НОМЕРА, /sources НОМЕР, /analyze НОМЕР (текст заявки и Word/PDF будут переданы OpenAI).' if uid in admins else ''), menu)
+                + ('Профили: /expert_new, /expert_list, /expert_invite, /expert_resume. Администратор: /today, /overdue, /list [страница], /view НОМЕР, /status НОМЕР new|review|done, /summary, /export, /import, /meeting НОМЕРА, /sources НОМЕР, /analyze НОМЕР (текст заявки и Word/PDF будут переданы OpenAI); /archive НОМЕР — в архив, /restore НОМЕР — восстановить, /archived — архив предложений.' if uid in admins else ''), menu)
         elif cmd == '/id' or text == 'Мой ID':
             say(db, uid, f'Ваш Telegram ID: {uid}')
         elif cmd == '/about' or text == 'О совете':
@@ -182,8 +185,43 @@ def process(path, admins, update):
                 for admin in admins:
                     say(db, admin, f'Новое предложение №{draft["id"]}. Открыть: /view {draft["id"]}')
         elif cmd == '/my' or text == 'Мои предложения':
-            rows = db.execute("SELECT id,status FROM proposals WHERE user_id=? AND status!='draft' AND external_id='' ORDER BY id DESC LIMIT 30", (uid,)).fetchall()
+            rows = db.execute("SELECT id,status FROM proposals WHERE user_id=? AND status NOT IN ('draft','archived') AND external_id='' ORDER BY id DESC LIMIT 30", (uid,)).fetchall()
             say(db, uid, '\n'.join(f'№{r["id"]}: {STATUSES[r["status"]]}' for r in rows) or 'Отправленных предложений пока нет.')
+        elif cmd in ('/archive','/archiveconfirm','/restore','/archived'):
+            if uid not in admins:
+                say(db,uid,'Это действие доступно только администратору.')
+                return
+            if cmd == '/archived':
+                rows=db.execute("SELECT id,author FROM proposals WHERE status='archived' ORDER BY id DESC LIMIT 30").fetchall()
+                if not rows:
+                    say(db,uid,'Архив предложений пуст.')
+                else:
+                    for r in rows:
+                        inline(db,uid,f'Архив №{r["id"]}: {r["author"][:50]}',[[('Восстановить',f'/restore {r["id"]}')]])
+                return
+            args=text.split()
+            if len(args)!=2 or not re.fullmatch(r'[1-9][0-9]{0,12}',args[1]):
+                say(db,uid,'Укажите номер, например /archive 12')
+                return
+            pid=int(args[1])
+            row=db.execute('SELECT id,status,archived_previous_status FROM proposals WHERE id=?',(pid,)).fetchone()
+            if not row or row['status']=='draft':
+                say(db,uid,'Предложение не найдено.')
+            elif cmd=='/restore':
+                if row['status']!='archived':
+                    say(db,uid,'Предложение уже активно.')
+                else:
+                    old=row['archived_previous_status'] if row['archived_previous_status'] in ('new','review','done') else 'new'
+                    db.execute('UPDATE proposals SET status=? WHERE id=?',(old,pid))
+                    say(db,uid,f'Предложение №{pid} восстановлено.')
+            elif row['status']=='archived':
+                say(db,uid,'Предложение уже в архиве. Восстановление: /restore '+str(pid))
+            elif cmd=='/archive':
+                inline(db,uid,f'Переместить предложение №{pid} в архив? Файлы и история сохранятся.',[[('Да, в архив',f'/archiveconfirm {pid}'),('Отмена',f'/view {pid}')]])
+            else:
+                db.execute("UPDATE proposals SET archived_previous_status=status,status='archived' WHERE id=? AND status!='archived'",(pid,))
+                say(db,uid,f'Предложение №{pid} в архиве. Восстановить: /restore {pid}')
+            return
         elif cmd == '/meeting':
             if uid not in admins:
                 say(db, uid, 'Команда доступна только администратору.')
@@ -228,7 +266,7 @@ def process(path, admins, update):
                 except ValueError as error:
                     say(db, uid, str(error))
             elif cmd == '/summary':
-                rows = db.execute("SELECT status,count(*) n FROM proposals WHERE status!='draft' GROUP BY status").fetchall()
+                rows = db.execute("SELECT status,count(*) n FROM proposals WHERE status NOT IN ('draft','archived') GROUP BY status").fetchall()
                 say(db, uid, 'Сводка по статусам (без ИИ):\n' + ('\n'.join(f'{STATUSES[r["status"]]}: {r["n"]}' for r in rows) or 'Нет предложений.'))
             elif cmd in ('/today', '/overdue'):
                 if len(args) > 2 or (len(args) == 2 and not re.fullmatch(r'[1-9][0-9]{0,6}', args[1])):
@@ -244,14 +282,14 @@ def process(path, admins, update):
                 if len(args) != (3 if cmd == '/status' else 2) or not re.fullmatch(r'[1-9][0-9]{0,12}', args[1]):
                     say(db, uid, 'Формат: /view НОМЕР или /status НОМЕР new|review|done')
                     return
-                row = db.execute("SELECT * FROM proposals WHERE id=? AND status!='draft'", (int(args[1]),)).fetchone()
+                row = db.execute("SELECT * FROM proposals WHERE id=? AND status NOT IN ('draft','archived')", (int(args[1]),)).fetchone()
                 if not row:
                     say(db, uid, 'Предложение не найдено.')
                 elif cmd == '/view':
                     if row['external_id']:
                         say(db, uid, f'Источник: {row["source_site"]} · {row["external_id"]}\nАвтор указан администратором по материалам сайта. Дата создания — дата импорта в бот.')
                     say(db, uid, f'№{row["id"]} · {STATUSES[row["status"]]}\n{row["created"]} UTC\n{row["author"]}\n\n{row["body"]}')
-                    inline(db, uid, 'Действия по заявке №' + str(row['id']), [[('Анализ ИИ', f'/analyze {row["id"]}'), ('Источники', f'/sources {row["id"]}')]])
+                    inline(db, uid, 'Действия по заявке №' + str(row['id']), [[('Анализ ИИ', f'/analyze {row["id"]}'), ('Источники', f'/sources {row["id"]}')], [('В архив', f'/archive {row["id"]}')]])
                     review_card(db, uid, row, say, inline)
                     for file in db.execute('SELECT * FROM files WHERE proposal_id=?', (row['id'],)):
                         queue(db, 'sendDocument', {'chat_id': uid, 'document': file['file_id'], 'caption': f'Предложение №{row["id"]}'})
@@ -293,7 +331,7 @@ def inline(db, uid, text, buttons):
 
 
 def show_registry(db, uid, page, only_new=False):
-    condition = "status='new'" if only_new else "status!='draft'"
+    condition = "status='new'" if only_new else "status NOT IN ('draft','archived')"
     total = db.execute('SELECT count(*) FROM proposals WHERE ' + condition).fetchone()[0]
     pages = max(1, (total + 9) // 10)
     page = min(page, pages)
@@ -589,7 +627,7 @@ def request_analysis(db, uid, admins, text):
     if len(parts) != 2 or not re.fullmatch(r'[1-9][0-9]{0,12}', parts[1]):
         say(db, uid, 'Формат: /analyze НОМЕР. Текст этой заявки будет передан OpenAI.')
         return
-    row = db.execute("SELECT * FROM proposals WHERE id=? AND status!='draft'", (int(parts[1]),)).fetchone()
+    row = db.execute("SELECT * FROM proposals WHERE id=? AND status NOT IN ('draft','archived')", (int(parts[1]),)).fetchone()
     if not row:
         say(db, uid, 'Зарегистрированное предложение не найдено.')
         return

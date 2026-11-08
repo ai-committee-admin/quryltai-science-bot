@@ -7,7 +7,7 @@ from openpyxl.styles import Font, PatternFill, Alignment
 
 
 def build_registry(db, statuses):
-    rows = db.execute("SELECT * FROM proposals WHERE status!='draft' ORDER BY id").fetchall()
+    rows = db.execute("SELECT * FROM proposals WHERE status NOT IN ('draft','archived') ORDER BY id").fetchall()
     if len(rows) > 5000:
         raise ValueError('В реестре больше 5000 заявок. Нужна выгрузка по периодам; файл не создан.')
     wb = Workbook()
