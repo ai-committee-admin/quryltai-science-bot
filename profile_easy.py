@@ -123,7 +123,7 @@ def handle_easy(db,admins,update,queue):
             else:
                 db.execute('UPDATE expert_profiles SET confirmed=0,published=0,revision=revision+1 WHERE id=?',(pid,))
                 from group_tasks import emit
-                emit(db,queue,cid,'Карточка скрыта из списка и подбора. Напишите администратору, что нужно исправить; ваши задания доступны как прежде.')
+                emit(db,queue,cid,'Карточка скрыта из списка и подбора. Напишите администратору, что нужно исправить; ваши кейсы доступны как прежде.')
                 for admin in admins:send(db,queue,admin,f'{p["name"]} просит исправить профиль №{pid}. Уточните замечания и используйте /profile_edit. После исправления ответьте на сообщение эксперта командой /profile_link.')
             return True
         return False

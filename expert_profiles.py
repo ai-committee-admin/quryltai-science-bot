@@ -61,7 +61,7 @@ def handle_profiles(db,admins,update,queue):
         if action=='edit':
             send(db,queue,uid,f'Для изменения отправьте /profile_edit {pid} topics | Новые темы через запятую\nПоля: name, role, topics, experience, education. После правки подтвердите профиль повторно.');return True
         if action=='hide':
-            db.execute('UPDATE expert_profiles SET confirmed=0,published=0,revision=revision+1 WHERE id=?',(pid,));send(db,queue,uid,'Профиль скрыт из списка и подбора. Ваши задания сохранены.');return True
+            db.execute('UPDATE expert_profiles SET confirmed=0,published=0,revision=revision+1 WHERE id=?',(pid,));send(db,queue,uid,'Профиль скрыт из списка и подбора. Ваше участие в кейсах сохранено.');return True
         enabled=db.execute('SELECT enabled FROM council_groups WHERE chat=?',(p['chat'],)).fetchone()
         if p['revision']!=int(rev) or not enabled or not enabled[0]:
             send(db,queue,uid,'Карточка изменилась или чат отключён. Откройте /profile для актуальной версии.');return True
@@ -173,10 +173,10 @@ def group_profiles(db,queue,cid,uid,text):
     if cmd=='/recommend':
         tid=parts[1] if len(parts)==2 and parts[1].isdigit() else None
         task=db.execute('SELECT * FROM council_tasks WHERE id=? AND chat=?',(tid,cid)).fetchone()
-        if not task:emit(db,queue,cid,'Формат: /recommend НОМЕР_ЗАДАНИЯ');return True
+        if not task:emit(db,queue,cid,'Формат: /recommend НОМЕР_КЕЙСА');return True
         lines=[]
         for p in db.execute('SELECT * FROM expert_profiles WHERE chat=? AND (confirmed=1 OR published=1) ORDER BY name',(cid,)).fetchall():
             matches=matching_topics(p['topics'],task['body'])
             if matches:lines.append(f'{p["name"]} (профиль №{p["id"]}): совпадают темы «'+ '», «'.join(matches)+'». '+('Подтверждён экспертом.' if p['confirmed'] else 'По резюме; эксперт не подтвердил.'))
-        emit(db,queue,cid,f'Подбор по тексту задания №{tid}:\n'+('\n'.join(lines) if lines else 'Прямых совпадений с темами опубликованных профилей нет.')+'\nСовпадения по темам. Участие открыто всем экспертам.');return True
+        emit(db,queue,cid,f'Подбор по теме кейса №{tid}:\n'+('\n'.join(lines) if lines else 'Прямых совпадений с темами опубликованных профилей нет.')+'\nСовпадения по темам. Участие открыто всем экспертам.');return True
     return False
