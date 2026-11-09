@@ -73,6 +73,8 @@ def initialize(path):
         initialize_review(db)
         initialize_import(db)
         initialize_groups(db)
+        from zhanel import initialize as initialize_zhanel
+        initialize_zhanel(db)
         from science_analytics import initialize_analytics
         initialize_analytics(db)
         from semantic_knowledge import initialize_semantic
