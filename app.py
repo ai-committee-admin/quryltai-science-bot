@@ -86,6 +86,8 @@ def initialize(path):
         from conclusions import initialize_conclusions
         initialize_conclusions(db)
         initialize_profiles(db)
+        from expert_registry import initialize as initialize_expert_registry
+        initialize_expert_registry(db)
         initialize_easy(db)
         document_router.initialize(db)
         proposal_cols = {c[1] for c in db.execute('PRAGMA table_info(proposals)')}
@@ -122,6 +124,9 @@ def process(path, admins, update):
         if document_router.choose(db, update.get('callback_query') or {}, admins, queue):
             return
         if handle_easy(db, admins, update, queue):
+            return
+        from expert_registry import handle_private as handle_expert_registry
+        if handle_expert_registry(db, admins, update, queue):
             return
         if handle_profiles(db, admins, update, queue):
             return
@@ -825,6 +830,8 @@ def analysis_worker(path, admins):
         try:
             from case_brief import run_brief_once
             did_brief = run_brief_once(path, admins)
+            from expert_registry import import_pending_once
+            did_expert_import = import_pending_once(path,admins,os.environ.get("TELEGRAM_BOT_TOKEN", ""))
             from moderator import run_moderator_once
             did_moderator = run_moderator_once(path, admins)
             from conclusions import run_conclusion_once
@@ -836,7 +843,7 @@ def analysis_worker(path, admins):
             did_cv = run_cv_once(path, admins, connect, queue, download_document, extract_document,
                                   lambda source: generate_analysis(source, os.environ.get('OPENAI_MODEL', 'gpt-6-luna'), CV_INSTRUCTIONS))
             did_document = document_router.run_once(path,admins,connect,queue,download_document,extract_document,generate_analysis,os.environ.get('OPENAI_MODEL','gpt-6-luna'))
-            if not run_analysis_once(path, admins) and not did_cv and not did_brief and not did_document and not did_moderator and not did_conclusion and not did_semantic and not did_science_analytics:
+            if not run_analysis_once(path, admins) and not did_cv and not did_brief and not did_document and not did_moderator and not did_conclusion and not did_semantic and not did_science_analytics and not did_expert_import:
                 time.sleep(1)
         except Exception:
             print('Analysis worker error; no input or secrets logged.', flush=True)
@@ -866,6 +873,9 @@ def main():
     if not result.get('ok'):
         raise SystemExit('Webhook registration failed. Check token, service URL and Telegram availability.')
     recover_analysis(path)
+    with connect(path) as db:
+        if db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='expert_import_jobs'").fetchone():
+            db.execute("UPDATE expert_import_jobs SET state='pending' WHERE state='working'")
     with connect(path) as db:
         for job in db.execute("SELECT * FROM document_analysis WHERE state='running'"):
             db.execute("UPDATE document_analysis SET state='failed',result='Прервано перезапуском' WHERE id=?",(job['id'],))
