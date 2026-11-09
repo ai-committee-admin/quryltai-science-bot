@@ -196,8 +196,8 @@ def handle_group(db,admins,update,queue):
             else:feedback('Нет прав.')
         elif action=='similar':
             if chair:
-                from knowledge import display
-                display(db,queue,cid,task['body'][:1000],exclude=tid)
+                from semantic_knowledge import request
+                feedback(request(db,cid,uid,task['body'][:1000],exclude=tid))
             else:feedback('Поиск по базе знаний доступен ведущему или администратору.')
         elif action=='brief':
             if not chair:
@@ -293,8 +293,11 @@ def handle_group(db,admins,update,queue):
         query=text.split(None,1)[1].strip() if len(parts)>1 else ''
         if len(query)<3:
             emit(db,queue,cid,'Пример: /knowledge грантовое финансирование науки');return True
-        from knowledge import display
-        display(db,queue,cid,query[:500]);return True
+        if cmd=='/findcase':
+            from knowledge import display
+            display(db,queue,cid,query[:500]);return True
+        from semantic_knowledge import request
+        emit(db,queue,cid,request(db,cid,uid,query[:500]));return True
     if cmd=='/similar':
         if not chair:
             emit(db,queue,cid,'Поиск доступен только ведущему или администратору.');return True
@@ -304,8 +307,8 @@ def handle_group(db,admins,update,queue):
         old=db.execute('SELECT * FROM council_tasks WHERE id=? AND chat=? AND archived=0',(tid,cid)).fetchone()
         if not old:
             emit(db,queue,cid,'Активный кейс в этом чате не найден.');return True
-        from knowledge import display
-        display(db,queue,cid,old['body'][:1000],exclude=tid);return True
+        from semantic_knowledge import request
+        emit(db,queue,cid,request(db,cid,uid,old['body'][:1000],exclude=tid));return True
     if cmd=='/archivedcases':
         if not chair:
             emit(db,queue,cid,'Архив доступен только ведущему или администратору.');return True
