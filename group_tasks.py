@@ -19,6 +19,8 @@ def initialize_groups(db):
     ''')
     if 'archived' not in {c[1] for c in db.execute('PRAGMA table_info(council_tasks)')}:
         db.execute('ALTER TABLE council_tasks ADD COLUMN archived INTEGER NOT NULL DEFAULT 0')
+    from recommendations import initialize
+    initialize(db)
 
 
 def emit(db, queue, chat, text, buttons=(), task=None, reply=None):
@@ -56,6 +58,7 @@ def task_card(db, queue, task, existing=None):
     buttons += [[('Подготовить справку',f'g:brief:{tid}')]]
     buttons += [[('Вопросы для обсуждения',f'g:questions:{tid}'),('Подвести итоги',f'g:summary:{tid}')]]
     buttons += [[('Сформировать заключение',f'g:conclusion:{tid}'),('Скачать Word',f'g:wordconclusion:{tid}')]]
+    buttons += [[('Рекомендации',f'g:reclist:{tid}')]]
     buttons += [[('Доработать заключение',f'g:editconclusion:{tid}')]]
     buttons += [[('Материалы и мнения',f'g:results:{tid}'),('Обновить карточку',f'g:card:{tid}')]]
     if not task['closed']:
@@ -146,6 +149,17 @@ def handle_group(db,admins,update,queue):
         data=cb.get('data','')
         if not re.fullmatch(r'g:[a-z]+:[0-9]+(?::[0-9]+){0,2}',data):return True
         _,action,*nums=data.split(':');nums=list(map(int,nums));tid=nums[0]
+        if action in ('recview','recstatus'):
+            if not chair:feedback('Только администратор или ведущий.')
+            else:
+                from recommendations import show,update_field
+                if action=='recstatus':
+                    if len(nums)!=2:feedback('Ошибка команды.');return True
+                    feedback(update_field(db,cid,tid,uid,'status',nums[1]))
+                text2,buttons2=show(db,cid,tid)
+                if text2:emit(db,queue,cid,text2,buttons2)
+                else:feedback('Рекомендация не найдена.')
+            return True
         if action=='analyticword':
             if not chair:feedback('Только администратор или ведущий.')
             else:
@@ -200,6 +214,12 @@ def handle_group(db,admins,update,queue):
                 task=db.execute('SELECT * FROM council_tasks WHERE id=?',(tid,)).fetchone()
                 task_card(db,queue,task)
             else:feedback('Нет прав.')
+        elif action=='reclist':
+            if not chair:feedback('Только администратор или ведущий.')
+            else:
+                from recommendations import list_items
+                text2,buttons2=list_items(db,cid,tid)
+                emit(db,queue,cid,text2,buttons2)
         elif action=='similar':
             if chair:
                 from semantic_knowledge import request
@@ -293,6 +313,31 @@ def handle_group(db,admins,update,queue):
             emit(db,queue,cid,'Мнения до: '+parts[2] if changed else 'Открытый кейс не найден.')
         except (ValueError,IndexError):emit(db,queue,cid,'Формат: /due 1 15.11.2026. Мнения ожидаются до конца указанного дня по времени Астаны.')
         return True
+    if cmd in ('/recommendations','/rec','/recadd','/recorg','/recdate','/recnote','/rechistory'):
+        if not chair:
+            emit(db,queue,cid,'Рекомендации доступны только администратору или ведущему.');return True
+        from recommendations import add,update_field,show,list_items,history
+        if cmd=='/recommendations':
+            taskid=int(parts[1]) if len(parts)>1 and parts[1].isdigit() else None
+            result,buttons=list_items(db,cid,taskid)
+            emit(db,queue,cid,result,buttons)
+        elif cmd=='/recadd':
+            if len(parts)<3 or not parts[1].isdigit():emit(db,queue,cid,'Пример: /recadd 1 Предусмотреть базовое финансирование лабораторий.')
+            else:emit(db,queue,cid,add(db,cid,int(parts[1]),uid,text.split(None,2)[2]))
+        elif len(parts)<2 or not parts[1].isdigit():
+            emit(db,queue,cid,'Нужен номер рекомендации. Например: /rec 1')
+        else:
+            rid=int(parts[1])
+            if cmd=='/rec':
+                result,buttons=show(db,cid,rid)
+                emit(db,queue,cid,result or 'Рекомендация не найдена.',buttons)
+            elif cmd=='/rechistory':emit(db,queue,cid,history(db,cid,rid))
+            else:
+                if len(parts)<3:emit(db,queue,cid,'После номера укажи значение.')
+                else:
+                    field={'/recorg':'agency','/recdate':'due','/recnote':'note'}[cmd]
+                    emit(db,queue,cid,update_field(db,cid,rid,uid,field,text.split(None,2)[2]))
+        return True
     if cmd=='/analytics':
         if not chair:
             emit(db,queue,cid,'Сводная аналитика доступна только администратору или ведущему.')
@@ -343,7 +388,7 @@ def handle_group(db,admins,update,queue):
         rows=db.execute('SELECT * FROM council_tasks WHERE chat=? AND archived=0 ORDER BY id DESC LIMIT 10 OFFSET ?',(cid,offset)).fetchall()
         emit(db,queue,cid,'Кейсы этого чата. Следующая страница: /cases '+str(offset+10),[[(f'№{t["id"]}: {t["body"][:45]}',f'g:card:{t["id"]}')] for t in rows]);return True
     if cmd=='/grouphelp':
-        emit(db,queue,cid,'Новый кейс: начните сообщение с «Кейс:» или отправьте /case ответом на текст/документ.\nЭксперт: ответьте текстом на карточку кейса — мнение сохранится автоматически. Материалы сохраняются без отдельных уведомлений.\nДля привязки ранее отправленного сообщения: /attach ответом на своё сообщение.\n/cases — кейсы; /archivedcases — архив; /due НОМЕР ДД.ММ.ГГГГ — дата для представления мнений.');return True
+        emit(db,queue,cid,'Новый кейс: начните сообщение с «Кейс:» или отправьте /case ответом на текст/документ.\nЭксперт: ответьте текстом на карточку кейса — мнение сохранится автоматически. Материалы сохраняются без отдельных уведомлений.\nДля привязки ранее отправленного сообщения: /attach ответом на своё сообщение.\n/cases — кейсы; /archivedcases — архив; /due НОМЕР ДД.ММ.ГГГГ — срок мнений.\n/recommendations — контроль рекомендаций; /recadd НОМЕР текст — добавить рекомендацию.');return True
     # Deliberate intake replaces a prompt under every ordinary chat message.
     deliberate_task = chair and (cmd=='/task' or text.casefold().startswith(('кейс:','задание:')))
     deliberate_attach = cmd=='/attach'
@@ -380,6 +425,8 @@ def handle_group(db,admins,update,queue):
 
 def schedule_groups(db,queue,now):
     if now.hour<9:return
+    from recommendations import reminders
+    reminders(db,queue,now,emit)
     day=now.date().isoformat()
     rows=db.execute("SELECT t.*,m.uid,m.name FROM council_tasks t JOIN council_groups g ON g.chat=t.chat JOIN council_members m ON m.task=t.id WHERE g.enabled=1 AND t.closed=0 AND t.archived=0 AND t.deadline!='' AND t.deadline<=? AND m.state IN ('working','revision')",(day,)).fetchall()
     grouped={}
