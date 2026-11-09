@@ -77,6 +77,8 @@ def initialize(path):
         initialize_moderator(db)
         from case_brief import initialize_briefs
         initialize_briefs(db)
+        from conclusions import initialize_conclusions
+        initialize_conclusions(db)
         initialize_profiles(db)
         initialize_easy(db)
         document_router.initialize(db)
@@ -476,7 +478,7 @@ def deliver_item(token, method, payload, admins):
     if method!='uploadCase' and payload.get('chat_id') not in admins:
         return {'ok': False, 'error_code': 403}
     filename = 'science-meeting.docx' if method == 'uploadMeeting' else 'science-registry.xlsx'
-    if method=='uploadCase':filename=f'case-{int(payload["task"])}-brief.docx'
+    if method=='uploadCase':filename=payload.get('filename') or f'case-{int(payload["task"])}-brief.docx'
     mime = 'application/vnd.openxmlformats-officedocument.' + ('wordprocessingml.document' if method in ('uploadMeeting','uploadCase') else 'spreadsheetml.sheet')
     boundary = 'Science' + uuid.uuid4().hex
     data = base64.b64decode(payload['data'])
@@ -801,6 +803,8 @@ def recover_analysis(path):
         recover_briefs(db,queue)
         from moderator import recover_moderator
         recover_moderator(db,queue)
+        from conclusions import recover_conclusions
+        recover_conclusions(db,queue)
         for row in db.execute("SELECT * FROM ai_jobs WHERE status='running'").fetchall():
             db.execute("UPDATE ai_jobs SET status='failed',result='Interrupted by restart' WHERE id=?", (row['id'],))
             say(db, row['requested_by'], f'Анализ №{row["proposal_id"]} прерван перезапуском. Для повторной попытки: /analyze {row["proposal_id"]}. Предыдущий запрос мог быть тарифицирован.')
@@ -813,10 +817,12 @@ def analysis_worker(path, admins):
             did_brief = run_brief_once(path, admins)
             from moderator import run_moderator_once
             did_moderator = run_moderator_once(path, admins)
+            from conclusions import run_conclusion_once
+            did_conclusion = run_conclusion_once(path, admins)
             did_cv = run_cv_once(path, admins, connect, queue, download_document, extract_document,
                                   lambda source: generate_analysis(source, os.environ.get('OPENAI_MODEL', 'gpt-6-luna'), CV_INSTRUCTIONS))
             did_document = document_router.run_once(path,admins,connect,queue,download_document,extract_document,generate_analysis,os.environ.get('OPENAI_MODEL','gpt-6-luna'))
-            if not run_analysis_once(path, admins) and not did_cv and not did_brief and not did_document and not did_moderator:
+            if not run_analysis_once(path, admins) and not did_cv and not did_brief and not did_document and not did_moderator and not did_conclusion:
                 time.sleep(1)
         except Exception:
             print('Analysis worker error; no input or secrets logged.', flush=True)

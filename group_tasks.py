@@ -55,6 +55,8 @@ def task_card(db, queue, task, existing=None):
     buttons += [[('Подобрать экспертов',f'g:recommend:{tid}')]]
     buttons += [[('Подготовить справку',f'g:brief:{tid}')]]
     buttons += [[('Вопросы для обсуждения',f'g:questions:{tid}'),('Подвести итоги',f'g:summary:{tid}')]]
+    buttons += [[('Сформировать заключение',f'g:conclusion:{tid}'),('Скачать Word',f'g:wordconclusion:{tid}')]]
+    buttons += [[('Доработать заключение',f'g:editconclusion:{tid}')]]
     buttons += [[('Материалы и мнения',f'g:results:{tid}'),('Обновить карточку',f'g:card:{tid}')]]
     if not task['closed']:
         buttons += [[('Завершить обсуждение',f'g:close:{tid}')]]
@@ -204,6 +206,19 @@ def handle_group(db,admins,update,queue):
             else:
                 from moderator import request_moderation
                 feedback(request_moderation(db,task,uid,action))
+        elif action in ('conclusion','wordconclusion','editconclusion'):
+            if not chair:
+                feedback('Доступно только ведущему или администратору.')
+            else:
+                from conclusions import request_conclusion,export_conclusion
+                if action=='conclusion':feedback(request_conclusion(db,task,uid,'draft'))
+                elif action=='wordconclusion':feedback(export_conclusion(db,queue,task))
+                else:
+                    if not db.execute('SELECT 1 FROM conclusion_drafts WHERE task=?',(tid,)).fetchone():
+                        feedback('Сначала сформируйте заключение.')
+                    else:
+                        db.execute('INSERT INTO conclusion_edits(chat,uid,task) VALUES(?,?,?) ON CONFLICT(chat,uid) DO UPDATE SET task=excluded.task,created=CURRENT_TIMESTAMP',(cid,uid,tid))
+                        emit(db,queue,cid,f'Кейс №{tid}: напишите одним сообщением, что изменить в заключении. Для отмены: /cancelconclusion. Это сообщение не попадёт в мнения экспертов.')
         elif action=='recommend':
             from expert_profiles import group_profiles
             group_profiles(db,queue,cid,uid,f'/recommend {tid}')
@@ -235,6 +250,19 @@ def handle_group(db,admins,update,queue):
         elif action in ('accept','revise','close','confirm'):
             emit(db,queue,cid,'Это действие доступно депутату или администратору бота.')
         return True
+    # Explicit edit mode: consume the administrator's next message, never record it as an opinion.
+    if chair and cmd=='/cancelconclusion':
+        db.execute('DELETE FROM conclusion_edits WHERE chat=? AND uid=?',(cid,uid))
+        emit(db,queue,cid,'Доработка заключения отменена.');return True
+    if chair and not cmd.startswith('/'):
+        pending_edit=db.execute('SELECT * FROM conclusion_edits WHERE chat=? AND uid=?',(cid,uid)).fetchone()
+        if pending_edit:
+            db.execute('DELETE FROM conclusion_edits WHERE chat=? AND uid=?',(cid,uid))
+            target=db.execute('SELECT * FROM council_tasks WHERE chat=? AND id=?',(cid,pending_edit['task'])).fetchone()
+            from conclusions import request_conclusion
+            if target:
+                emit(db,queue,cid,request_conclusion(db,target,uid,'edit',text))
+            return True
     from expert_profiles import group_profiles
     if group_profiles(db,queue,cid,uid,text):return True
     if cmd in ('/chair','/unchair') and uid in admins:
