@@ -52,7 +52,7 @@ def task_card(db, queue, task, existing=None):
         emit(db,queue,task['chat'],text,[[('Восстановить',f'g:restore:{tid}')]],tid)
         return
     buttons=[]  # Responses to linked case messages are recorded automatically.
-    buttons += [[('Подобрать экспертов',f'g:recommend:{tid}')]]
+    buttons += [[('Подобрать экспертов',f'g:recommend:{tid}'),('Похожие кейсы',f'g:similar:{tid}')]]
     buttons += [[('Подготовить справку',f'g:brief:{tid}')]]
     buttons += [[('Вопросы для обсуждения',f'g:questions:{tid}'),('Подвести итоги',f'g:summary:{tid}')]]
     buttons += [[('Сформировать заключение',f'g:conclusion:{tid}'),('Скачать Word',f'g:wordconclusion:{tid}')]]
@@ -176,7 +176,7 @@ def handle_group(db,admins,update,queue):
             return True
         task=db.execute('SELECT * FROM council_tasks WHERE id=? AND chat=?',(tid,cid)).fetchone()
         if not task:return True
-        if task['archived'] and action!='restore':
+        if task['archived'] and action not in ('restore',):
             feedback('Кейс находится в архиве.');return True
         member=db.execute('SELECT * FROM council_members WHERE task=? AND uid=?',(tid,uid)).fetchone()
         if action=='archive':
@@ -194,6 +194,11 @@ def handle_group(db,admins,update,queue):
                 task=db.execute('SELECT * FROM council_tasks WHERE id=?',(tid,)).fetchone()
                 task_card(db,queue,task)
             else:feedback('Нет прав.')
+        elif action=='similar':
+            if chair:
+                from knowledge import display
+                display(db,queue,cid,task['body'][:1000],exclude=tid)
+            else:feedback('Поиск по базе знаний доступен ведущему или администратору.')
         elif action=='brief':
             if not chair:
                 feedback('Справку запрашивает депутат или администратор.')
@@ -282,6 +287,25 @@ def handle_group(db,admins,update,queue):
             emit(db,queue,cid,'Мнения до: '+parts[2] if changed else 'Открытый кейс не найден.')
         except (ValueError,IndexError):emit(db,queue,cid,'Формат: /due 1 15.11.2026. Мнения ожидаются до конца указанного дня по времени Астаны.')
         return True
+    if cmd in ('/knowledge','/findcase'):
+        if not chair:
+            emit(db,queue,cid,'Поиск по базе знаний доступен только ведущему или администратору.');return True
+        query=text.split(None,1)[1].strip() if len(parts)>1 else ''
+        if len(query)<3:
+            emit(db,queue,cid,'Пример: /knowledge грантовое финансирование науки');return True
+        from knowledge import display
+        display(db,queue,cid,query[:500]);return True
+    if cmd=='/similar':
+        if not chair:
+            emit(db,queue,cid,'Поиск доступен только ведущему или администратору.');return True
+        try:tid=int(parts[1])
+        except (IndexError,ValueError):
+            emit(db,queue,cid,'Пример: /similar 12');return True
+        old=db.execute('SELECT * FROM council_tasks WHERE id=? AND chat=? AND archived=0',(tid,cid)).fetchone()
+        if not old:
+            emit(db,queue,cid,'Активный кейс в этом чате не найден.');return True
+        from knowledge import display
+        display(db,queue,cid,old['body'][:1000],exclude=tid);return True
     if cmd=='/archivedcases':
         if not chair:
             emit(db,queue,cid,'Архив доступен только ведущему или администратору.');return True
