@@ -27,7 +27,9 @@ def _intent(s):
     return 'unknown'
 
 
-def _case(db, chat, uid, msg, raw):
+def _case(db, chat, uid, msg, raw, ai_case_id=None):
+    if ai_case_id is not None:
+        return db.execute('SELECT * FROM council_tasks WHERE id=? AND chat=?',(ai_case_id,chat)).fetchone(), True
     found=NUMBER.search(raw)
     if found:
         task=db.execute('SELECT * FROM council_tasks WHERE id=? AND chat=?',(int(found.group(1)),chat)).fetchone()
@@ -61,6 +63,7 @@ def initialize(db):
     db.execute('''CREATE TABLE IF NOT EXISTS zhanel_context(
         chat INTEGER NOT NULL,uid INTEGER NOT NULL,task INTEGER NOT NULL,
         PRIMARY KEY(chat,uid))''')
+    db.execute('''CREATE TABLE IF NOT EXISTS zhanel_pending(chat INTEGER NOT NULL,uid INTEGER NOT NULL,action TEXT NOT NULL,topic TEXT NOT NULL DEFAULT '',created TEXT DEFAULT CURRENT_TIMESTAMP,PRIMARY KEY(chat,uid))''')
 
 
 def handle(db,queue,chat,uid,message,admins):
@@ -74,6 +77,33 @@ def handle(db,queue,chat,uid,message,admins):
         return True
     raw=text[match.end():].strip()
     action=_intent(raw)
+    ai=None
+    # Plain text AI classification. On errors fall back to safe local rules.
+    try:
+        from zhanel_ai import classify
+        ai=classify(raw) if action=='unknown' or len(raw.split())>8 else None
+    except Exception:
+        ai=None
+    if ai and ai['action']!='unknown':
+        action=ai['action']
+    # Explicit sensitive local verbs remain sensitive even if model misclassifies.
+    local_action=_intent(raw)
+    if local_action in ('archive','restore'):
+        action=local_action
+    elif ai and ai['action'] in ('archive','restore') and not re.search(r'(удал|убер|архив|өшір|жой|восстанов|верни|қайтар)',raw,re.I):
+        # Never use model inference alone to initiate a destructive workflow.
+        action='unknown'
+    pending=db.execute('SELECT action FROM zhanel_pending WHERE chat=? AND uid=?',(chat,uid)).fetchone()
+    if action=='unknown' and pending:
+        # Answer to an earlier clarification, e.g. «Жанель, номер 12».
+        if re.fullmatch(r'(?:кейс\s*)?(?:№\s*)?\d{1,10}',raw.strip(),re.I):
+            action=pending['action']
+        elif re.fullmatch(r'(?:отмена|отмени|cancel|болдырма)',raw.strip(),re.I):
+            db.execute('DELETE FROM zhanel_pending WHERE chat=? AND uid=?',(chat,uid))
+            emit(db,queue,chat,'Хорошо, отменено.')
+            return True
+    if action!='unknown':
+        db.execute('DELETE FROM zhanel_pending WHERE chat=? AND uid=?',(chat,uid))
     if action=='help' or not raw:
         emit(db,queue,chat,'Можешь писать обычными словами: «Жанель, подготовь заключение по кейсу №5», «Жанель, скачай заключение №5 в Word», «Жанель, подведи итоги кейса №5», «Жанель, найди похожие проблемы по грантам», «Жанель, что на контроле?». Для удаления я запрошу подтверждение.')
         return True
@@ -91,14 +121,14 @@ def handle(db,queue,chat,uid,message,admins):
         return True
     if action=='knowledge':
         from semantic_knowledge import request
-        query=re.sub(r'^(?:найди|найти|поищи|покажи|ізде)\s*', '',raw,flags=re.I).strip()
+        query=(ai.get('topic') if ai and ai['action']=='knowledge' else '') or re.sub(r'^(?:найди|найти|поищи|покажи|ізде)\s*', '',raw,flags=re.I).strip()
         if len(query)<3:
             emit(db,queue,chat,'Напиши тему: «Жанель, найди похожие проблемы по грантовому финансированию».')
         else:
             emit(db,queue,chat,request(db,chat,uid,query[:500]))
         return True
     if action=='create':
-        detail=re.sub(r'^.*?\bкейс\b\s*[:№.\-]?\s*','',raw,flags=re.I).strip()
+        detail=(ai.get('topic') if ai and ai['action']=='create' else '') or re.sub(r'^.*?\bкейс\b\s*[:№.\-]?\s*','',raw,flags=re.I).strip()
         detail=re.sub(r'^\b(?:по|о|об|на тему)\b\s*','',detail,flags=re.I).strip()
         if len(detail)<12:
             emit(db,queue,chat,'Укажи тему и проблему: «Жанель, создай кейс: задержки грантового финансирования и их влияние на исследования».')
@@ -108,9 +138,16 @@ def handle(db,queue,chat,uid,message,admins):
         _remember(db,chat,uid,task_id)
         task_card(db,queue,task)
         return True
-    task,explicit=_case(db,chat,uid,message,raw)
+    target_number=None
+    if pending and action==pending['action'] and re.fullmatch(r'(?:кейс\s*)?(?:№\s*)?\d{1,10}',raw.strip(),re.I):
+        target_number=int(re.search(r'\d+',raw).group())
+    # Case number from AI is only a hint when that number is present in the user's words.
+    ai_id=ai.get('case_id') if ai else None
+    if ai_id and not re.search(r'(?<!\d)'+str(ai_id)+r'(?!\d)',raw):ai_id=None
+    task,explicit=_case(db,chat,uid,message,raw,target_number if target_number is not None else (ai_id if not NUMBER.search(raw) else None))
     if task is None:
-        emit(db,queue,chat,'Уточни номер кейса, например: «Жанель, подготовь заключение по кейсу №5». Можно также ответить Жанель на карточку кейса.')
+        db.execute('INSERT INTO zhanel_pending(chat,uid,action) VALUES(?,?,?) ON CONFLICT(chat,uid) DO UPDATE SET action=excluded.action,created=CURRENT_TIMESTAMP',(chat,uid,action))
+        emit(db,queue,chat,'Уточни номер кейса. Например: «Жанель, №5». Можно ответить на карточку кейса.')
         return True
     tid=task['id']
     if task['archived'] and action!='restore':
