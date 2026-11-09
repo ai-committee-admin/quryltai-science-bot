@@ -12,6 +12,13 @@ NUMBER = re.compile(r'\b(?:кейс(?:а|е|у|ом)?\s*(?:№|#)?\s*|№\s*|#\s
 def _intent(s):
     s=s.lower().replace('ё','е')
     if re.search(r'\b(?:удал|убер|архив|өшір|жой)\w*',s):return 'archive'
+    if re.search(r'(?:просроч|мерзімі өткен)',s) and re.search(r'(?:рекомендац|ұсыным)',s):return 'overdue'
+    if re.search(r'(?:кто|кім)\s+(?:высказ|писал|ответил|сказал|пікір)',s):return 'opinions'
+    if re.search(r'(?:обсужд|талқыла|мнения|пікір)',s) and re.search(r'(?:сегодня|вчера|бүгін|кеше)',s):return 'recent_discussions'
+    if re.search(r'(?:кейс|істер|кейстер)',s) and re.search(r'(?:сегодня|вчера|бүгін|кеше)',s):return 'dated_cases'
+    if re.search(r'(?:кейс|істер|кейстер)',s) and re.search(r'(?:открыт|активн|в работе|ашық)',s):return 'open_cases'
+    if re.search(r'(?:последн|самый свеж|соңғы)',s) and re.search(r'(?:кейс|істер|кейстер)',s) and not re.search(r'(?:заключ|қорытын|итог|word|ворд)',s):return 'latest_case'
+    if re.search(r'(?:какие|покажи|список|тізім)',s) and re.search(r'(?:кейс|істер|кейстер)',s) and not re.search(r'(?:найд|поиск|похож)',s):return 'open_cases'
     if re.search(r'\b(?:восстанов|верни|қайтар)\w*',s):return 'restore'
     if re.search(r'\b(?:созда|открой новый|жаңа іс|кейс аш)\w*',s) and 'кейс' in s:return 'create'
     if re.search(r'(?:доработ|исправ|передел|өзгерт|түзет)\w*',s) and re.search(r'заключ|қорытын',s):return 'edit'
@@ -60,6 +67,8 @@ def _remember(db,chat,uid,task):
 
 
 def initialize(db):
+    from zhanel_reports import initialize as initialize_reports
+    initialize_reports(db)
     db.execute('''CREATE TABLE IF NOT EXISTS zhanel_context(
         chat INTEGER NOT NULL,uid INTEGER NOT NULL,task INTEGER NOT NULL,
         PRIMARY KEY(chat,uid))''')
@@ -84,7 +93,7 @@ def handle(db,queue,chat,uid,message,admins):
         ai=classify(raw) if action=='unknown' or len(raw.split())>8 else None
     except Exception:
         ai=None
-    if ai and ai['action']!='unknown':
+    if ai and ai['action']!='unknown' and action not in ('dated_cases','open_cases','latest_case','recent_discussions','opinions','overdue'):
         action=ai['action']
     # Explicit sensitive local verbs remain sensitive even if model misclassifies.
     local_action=_intent(raw)
@@ -109,6 +118,25 @@ def handle(db,queue,chat,uid,message,admins):
         return True
     if action=='unknown':
         emit(db,queue,chat,'Не поняла просьбу. Попробуй: «Жанель, подготовь заключение по кейсу №5» или «Жанель, что у нас на контроле?»')
+        return True
+    if action in ('dated_cases','open_cases','latest_case','recent_discussions','opinions','overdue'):
+        from zhanel_reports import case_list,recent_discussions,opinions,overdue
+        period='yesterday' if re.search(r'вчера|кеше',raw,re.I) else 'today'
+        if action=='dated_cases':result,buttons=case_list(db,chat,period)
+        elif action=='open_cases':result,buttons=case_list(db,chat,'open')
+        elif action=='latest_case':result,buttons=case_list(db,chat,'latest')
+        elif action=='recent_discussions':result,buttons=recent_discussions(db,chat,period)
+        elif action=='overdue':result,buttons=overdue(db,chat)
+        else:
+            number_match=re.fullmatch(r'(?:кейс\s*)?(?:№\s*)?(\d{1,10})',raw.strip(),re.I)
+            pending_number=int(number_match.group(1)) if number_match else None
+            task,explicit=_case(db,chat,uid,message,raw,pending_number)
+            if task is None:
+                db.execute('INSERT INTO zhanel_pending(chat,uid,action) VALUES(?,?,?) ON CONFLICT(chat,uid) DO UPDATE SET action=excluded.action,created=CURRENT_TIMESTAMP',(chat,uid,action))
+                emit(db,queue,chat,'Уточни номер кейса, например «Жанель, №5».')
+                return True
+            result,buttons=opinions(db,chat,task['id'])
+        emit(db,queue,chat,result,buttons)
         return True
     if action=='recommendations':
         from recommendations import list_items
@@ -144,6 +172,9 @@ def handle(db,queue,chat,uid,message,admins):
     # Case number from AI is only a hint when that number is present in the user's words.
     ai_id=ai.get('case_id') if ai else None
     if ai_id and not re.search(r'(?<!\d)'+str(ai_id)+r'(?!\d)',raw):ai_id=None
+    if re.search(r'(?:последн|самый свеж|соңғы)\w*\s+(?:активн\w*\s+)?кейс',raw,re.I) and not NUMBER.search(raw):
+        latest=db.execute('SELECT id FROM council_tasks WHERE chat=? AND archived=0 ORDER BY id DESC LIMIT 1',(chat,)).fetchone()
+        if latest:target_number=latest['id']
     task,explicit=_case(db,chat,uid,message,raw,target_number if target_number is not None else (ai_id if not NUMBER.search(raw) else None))
     if task is None:
         db.execute('INSERT INTO zhanel_pending(chat,uid,action) VALUES(?,?,?) ON CONFLICT(chat,uid) DO UPDATE SET action=excluded.action,created=CURRENT_TIMESTAMP',(chat,uid,action))
