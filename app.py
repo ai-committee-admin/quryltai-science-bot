@@ -73,6 +73,8 @@ def initialize(path):
         initialize_review(db)
         initialize_import(db)
         initialize_groups(db)
+        from science_analytics import initialize_analytics
+        initialize_analytics(db)
         from semantic_knowledge import initialize_semantic
         initialize_semantic(db)
         from moderator import initialize_moderator
@@ -807,6 +809,8 @@ def recover_analysis(path):
         recover_moderator(db,queue)
         from conclusions import recover_conclusions
         recover_conclusions(db,queue)
+        from science_analytics import recover as recover_science_analytics
+        recover_science_analytics(db)
         from semantic_knowledge import recover
         recover(db)
         for row in db.execute("SELECT * FROM ai_jobs WHERE status='running'").fetchall():
@@ -823,12 +827,14 @@ def analysis_worker(path, admins):
             did_moderator = run_moderator_once(path, admins)
             from conclusions import run_conclusion_once
             did_conclusion = run_conclusion_once(path, admins)
+            from science_analytics import run_once as run_science_analytics_once
+            did_science_analytics = run_science_analytics_once(path,admins)
             from semantic_knowledge import run_once as run_semantic_once
             did_semantic = run_semantic_once(path,admins)
             did_cv = run_cv_once(path, admins, connect, queue, download_document, extract_document,
                                   lambda source: generate_analysis(source, os.environ.get('OPENAI_MODEL', 'gpt-6-luna'), CV_INSTRUCTIONS))
             did_document = document_router.run_once(path,admins,connect,queue,download_document,extract_document,generate_analysis,os.environ.get('OPENAI_MODEL','gpt-6-luna'))
-            if not run_analysis_once(path, admins) and not did_cv and not did_brief and not did_document and not did_moderator and not did_conclusion and not did_semantic:
+            if not run_analysis_once(path, admins) and not did_cv and not did_brief and not did_document and not did_moderator and not did_conclusion and not did_semantic and not did_science_analytics:
                 time.sleep(1)
         except Exception:
             print('Analysis worker error; no input or secrets logged.', flush=True)

@@ -130,7 +130,7 @@ def handle_group(db,admins,update,queue):
     if not cb and cmd in ('/council_on','/council_off') and uid in admins:
         db.execute('INSERT INTO council_groups VALUES(?,?) ON CONFLICT(chat) DO UPDATE SET enabled=excluded.enabled',(cid,int(cmd=='/council_on')))
         # Plain output for off command must still be delivered.
-        queue(db,'sendMessage',{'chat_id':cid,'text':'Кейсы включены. Для нового кейса начните сообщение с «Кейс:». /grouphelp — помощь.' if cmd=='/council_on' else 'Приём кейсов в этом чате отключён.'})
+        queue(db,'sendMessage',{'chat_id':cid,'text':'Кейсы включены. Для нового кейса начните сообщение с «Кейс:». /analytics — сводный анализ науки; /grouphelp — помощь.' if cmd=='/council_on' else 'Приём кейсов в этом чате отключён.'})
         return True
     enabled=db.execute('SELECT enabled FROM council_groups WHERE chat=?',(cid,)).fetchone()
     if not enabled or not enabled[0]:
@@ -146,6 +146,12 @@ def handle_group(db,admins,update,queue):
         data=cb.get('data','')
         if not re.fullmatch(r'g:[a-z]+:[0-9]+(?::[0-9]+){0,2}',data):return True
         _,action,*nums=data.split(':');nums=list(map(int,nums));tid=nums[0]
+        if action=='analyticword':
+            if not chair:feedback('Только администратор или ведущий.')
+            else:
+                from science_analytics import send_word
+                feedback(send_word(db,queue,cid,tid))
+            return True
         if action in ('create','choose','bind','ignore'):
             p=db.execute('SELECT * FROM council_pending WHERE id=? AND chat=? AND uid=? AND used=0',(tid,cid,uid)).fetchone()
             if not p:
@@ -286,6 +292,24 @@ def handle_group(db,admins,update,queue):
             changed=db.execute('UPDATE council_tasks SET deadline=? WHERE id=? AND chat=? AND closed=0',(date,tid,cid)).rowcount
             emit(db,queue,cid,'Мнения до: '+parts[2] if changed else 'Открытый кейс не найден.')
         except (ValueError,IndexError):emit(db,queue,cid,'Формат: /due 1 15.11.2026. Мнения ожидаются до конца указанного дня по времени Астаны.')
+        return True
+    if cmd=='/analytics':
+        if not chair:
+            emit(db,queue,cid,'Сводная аналитика доступна только администратору или ведущему.')
+        else:
+            from science_analytics import request
+            emit(db,queue,cid,request(db,cid,uid))
+        return True
+    if cmd=='/reportword':
+        if not chair:
+            emit(db,queue,cid,'Выгрузка доступна только администратору или ведущему.')
+        else:
+            from science_analytics import send_word
+            try:report_id=int(parts[1])
+            except (IndexError,ValueError):
+                emit(db,queue,cid,'Формат: /reportword НОМЕР')
+                return True
+            emit(db,queue,cid,send_word(db,queue,cid,report_id))
         return True
     if cmd in ('/knowledge','/findcase'):
         if not chair:
