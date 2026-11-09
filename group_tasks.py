@@ -308,6 +308,8 @@ def handle_group(db,admins,update,queue):
             if target:
                 emit(db,queue,cid,request_conclusion(db,target,uid,'edit',text))
             return True
+    from whatsapp_invites import handle_group as handle_wa_group
+    if not cb and handle_wa_group(db,admins,update,queue):return True
     from expert_registry import handle_group as handle_expert_candidates
     if not cb and handle_expert_candidates(db,admins,update,queue):return True
     from zhanel import handle as handle_zhanel

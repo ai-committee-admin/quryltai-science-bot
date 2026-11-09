@@ -88,6 +88,8 @@ def initialize(path):
         initialize_profiles(db)
         from expert_registry import initialize as initialize_expert_registry
         initialize_expert_registry(db)
+        from whatsapp_invites import initialize as initialize_wa_invites
+        initialize_wa_invites(db)
         initialize_easy(db)
         document_router.initialize(db)
         proposal_cols = {c[1] for c in db.execute('PRAGMA table_info(proposals)')}
@@ -122,6 +124,9 @@ def process(path, admins, update):
             return
         db.execute('INSERT INTO updates VALUES (?)', (update['update_id'],))
         if document_router.choose(db, update.get('callback_query') or {}, admins, queue):
+            return
+        from whatsapp_invites import handle_private as handle_wa_private
+        if handle_wa_private(db, admins, update, queue):
             return
         if handle_easy(db, admins, update, queue):
             return
@@ -872,6 +877,11 @@ def main():
         'allowed_updates': ['message', 'callback_query'], 'max_connections': 1})
     if not result.get('ok'):
         raise SystemExit('Webhook registration failed. Check token, service URL and Telegram availability.')
+    # Fetch the public bot username for Telegram deep links; never expose the bot token.
+    bot_info=api(token,'getMe',{})
+    public_name=((bot_info.get('result') or {}).get('username') if bot_info.get('ok') else '')
+    if public_name and re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{4,31}',public_name):
+        os.environ['TELEGRAM_BOT_USERNAME']=public_name
     recover_analysis(path)
     with connect(path) as db:
         if db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='expert_import_jobs'").fetchone():
