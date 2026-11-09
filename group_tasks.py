@@ -21,6 +21,8 @@ def initialize_groups(db):
         db.execute('ALTER TABLE council_tasks ADD COLUMN archived INTEGER NOT NULL DEFAULT 0')
     from recommendations import initialize
     initialize(db)
+    from recommendation_import import initialize as initialize_import
+    initialize_import(db)
 
 
 def emit(db, queue, chat, text, buttons=(), task=None, reply=None):
@@ -58,7 +60,7 @@ def task_card(db, queue, task, existing=None):
     buttons += [[('Подготовить справку',f'g:brief:{tid}')]]
     buttons += [[('Вопросы для обсуждения',f'g:questions:{tid}'),('Подвести итоги',f'g:summary:{tid}')]]
     buttons += [[('Сформировать заключение',f'g:conclusion:{tid}'),('Скачать Word',f'g:wordconclusion:{tid}')]]
-    buttons += [[('Рекомендации',f'g:reclist:{tid}')]]
+    buttons += [[('Рекомендации',f'g:reclist:{tid}'),('Из заключения',f'g:recpreview:{tid}')]]
     buttons += [[('Доработать заключение',f'g:editconclusion:{tid}')]]
     buttons += [[('Материалы и мнения',f'g:results:{tid}'),('Обновить карточку',f'g:card:{tid}')]]
     if not task['closed']:
@@ -149,6 +151,12 @@ def handle_group(db,admins,update,queue):
         data=cb.get('data','')
         if not re.fullmatch(r'g:[a-z]+:[0-9]+(?::[0-9]+){0,2}',data):return True
         _,action,*nums=data.split(':');nums=list(map(int,nums));tid=nums[0]
+        if action=='recimport':
+            if not chair: feedback('Только администратор или ведущий.')
+            else:
+                from recommendation_import import approve
+                feedback(approve(db,cid,uid,tid))
+            return True
         if action in ('recview','recstatus'):
             if not chair:feedback('Только администратор или ведущий.')
             else:
@@ -214,6 +222,12 @@ def handle_group(db,admins,update,queue):
                 task=db.execute('SELECT * FROM council_tasks WHERE id=?',(tid,)).fetchone()
                 task_card(db,queue,task)
             else:feedback('Нет прав.')
+        elif action=='recpreview':
+            if not chair:feedback('Только администратор или ведущий.')
+            else:
+                from recommendation_import import prepare
+                result,buttons=prepare(db,cid,tid)
+                emit(db,queue,cid,result,buttons)
         elif action=='reclist':
             if not chair:feedback('Только администратор или ведущий.')
             else:
@@ -312,6 +326,14 @@ def handle_group(db,admins,update,queue):
             changed=db.execute('UPDATE council_tasks SET deadline=? WHERE id=? AND chat=? AND closed=0',(date,tid,cid)).rowcount
             emit(db,queue,cid,'Мнения до: '+parts[2] if changed else 'Открытый кейс не найден.')
         except (ValueError,IndexError):emit(db,queue,cid,'Формат: /due 1 15.11.2026. Мнения ожидаются до конца указанного дня по времени Астаны.')
+        return True
+    if cmd=='/recfrom':
+        if not chair:emit(db,queue,cid,'Только администратор или ведущий.')
+        elif len(parts)<2 or not parts[1].isdigit():emit(db,queue,cid,'Пример: /recfrom 1')
+        else:
+            from recommendation_import import prepare
+            result,buttons=prepare(db,cid,int(parts[1]))
+            emit(db,queue,cid,result,buttons)
         return True
     if cmd in ('/recommendations','/rec','/recadd','/recorg','/recdate','/recnote','/rechistory'):
         if not chair:
