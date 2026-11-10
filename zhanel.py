@@ -67,6 +67,8 @@ def _remember(db,chat,uid,task):
 
 
 def initialize(db):
+    from case_orchestrator import initialize as initialize_workflow
+    initialize_workflow(db)
     from zhanel_reports import initialize as initialize_reports
     initialize_reports(db)
     from zhanel_dialogue import initialize as init_dialogue
@@ -89,6 +91,17 @@ def handle(db,queue,chat,uid,message,admins):
         emit(db,queue,chat,'Жанель выполняет действия с кейсами только по запросу администратора или ведущего.')
         return True
     raw=text[match.end():].strip()
+    # v4.4 workflow: explicit plan first; no records or outreach until confirmation.
+    from case_orchestrator import START as WORKFLOW_START, PROGRESS as WORKFLOW_PROGRESS
+    if WORKFLOW_START.search(raw):
+        from case_orchestrator import prepare
+        return prepare(db,queue,chat,uid,raw,emit)
+    if WORKFLOW_PROGRESS.search(raw):
+        from case_orchestrator import progress
+        number=NUMBER.search(raw)
+        found=int(number.group(1)) if number else None
+        task,_=_case(db,chat,uid,message,raw,found)
+        return progress(db,queue,chat,uid,task,emit)
     from zhanel_recommendation_actions import is_add_request, begin as begin_rec, text_confirmation
     if text_confirmation(db,queue,chat,uid,raw,emit):return True
     if is_add_request(raw):
