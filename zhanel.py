@@ -69,6 +69,8 @@ def _remember(db,chat,uid,task):
 def initialize(db):
     from zhanel_reports import initialize as initialize_reports
     initialize_reports(db)
+    from zhanel_dialogue import initialize as init_dialogue
+    init_dialogue(db)
     db.execute('''CREATE TABLE IF NOT EXISTS zhanel_context(
         chat INTEGER NOT NULL,uid INTEGER NOT NULL,task INTEGER NOT NULL,
         PRIMARY KEY(chat,uid))''')
@@ -85,6 +87,19 @@ def handle(db,queue,chat,uid,message,admins):
         emit(db,queue,chat,'Жанель выполняет действия с кейсами только по запросу администратора или ведущего.')
         return True
     raw=text[match.end():].strip()
+    from zhanel_dialogue import (CAPABILITIES, capability_question, expert_request,
+       selection, invite_request, candidate_search, selection_reply, invitation_reply, load, conversational_answer)
+    if capability_question(raw):
+        emit(db,queue,chat,CAPABILITIES)
+        return True
+    # Conversational follow-ups use only this administrator's scoped, short-lived context.
+    if expert_request(raw) and not re.search(r'кейс\w*\s*(?:№|#)?\s*\d+',raw,re.I):
+        candidate_search(db,queue,chat,uid,raw,emit)
+        return True
+    if selection(raw) and not re.search(r'кейс|заключен|рекомендац',raw,re.I) and selection_reply(db,queue,chat,uid,raw,emit):
+        return True
+    if invite_request(raw) and invitation_reply(db,queue,chat,uid,raw,emit):
+        return True
     action=_intent(raw)
     ai=None
     # Plain text AI classification. On errors fall back to safe local rules.
@@ -117,7 +132,9 @@ def handle(db,queue,chat,uid,message,admins):
         emit(db,queue,chat,'Можешь писать обычными словами: «Жанель, подготовь заключение по кейсу №5», «Жанель, скачай заключение №5 в Word», «Жанель, подведи итоги кейса №5», «Жанель, найди похожие проблемы по грантам», «Жанель, что на контроле?». Для удаления я запрошу подтверждение.')
         return True
     if action=='unknown':
-        emit(db,queue,chat,'Не поняла просьбу. Попробуй: «Жанель, подготовь заключение по кейсу №5» или «Жанель, что у нас на контроле?»')
+        state=load(db,chat,uid)
+        reply=conversational_answer(raw,(state['topic'] if state else ''))
+        emit(db,queue,chat,reply or 'Могу помочь с обсуждением, поиском специалистов и заключениями. Уточни задачу или назови научную тему.')
         return True
     if action in ('dated_cases','open_cases','latest_case','recent_discussions','opinions','overdue'):
         from zhanel_reports import case_list,recent_discussions,opinions,overdue
