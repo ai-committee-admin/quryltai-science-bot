@@ -71,6 +71,8 @@ def initialize(db):
     initialize_reports(db)
     from zhanel_dialogue import initialize as init_dialogue
     init_dialogue(db)
+    from zhanel_recommendation_actions import initialize as init_recs
+    init_recs(db)
     db.execute('''CREATE TABLE IF NOT EXISTS zhanel_context(
         chat INTEGER NOT NULL,uid INTEGER NOT NULL,task INTEGER NOT NULL,
         PRIMARY KEY(chat,uid))''')
@@ -87,6 +89,10 @@ def handle(db,queue,chat,uid,message,admins):
         emit(db,queue,chat,'Жанель выполняет действия с кейсами только по запросу администратора или ведущего.')
         return True
     raw=text[match.end():].strip()
+    from zhanel_recommendation_actions import is_add_request, begin as begin_rec, text_confirmation
+    if text_confirmation(db,queue,chat,uid,raw,emit):return True
+    if is_add_request(raw):
+        return begin_rec(db,queue,chat,uid,raw,emit)
     from zhanel_dialogue import (CAPABILITIES, capability_question, expert_request,
        selection, invite_request, candidate_search, selection_reply, invitation_reply, load, conversational_answer)
     if capability_question(raw):

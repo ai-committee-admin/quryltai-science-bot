@@ -151,6 +151,10 @@ def handle_group(db,admins,update,queue):
         data=cb.get('data','')
         if not re.fullmatch(r'g:[a-z]+:[0-9]+(?::[0-9]+){0,2}',data):return True
         _,action,*nums=data.split(':');nums=list(map(int,nums));tid=nums[0]
+        if action in ('zrconfirm','zrcancel'):
+            from zhanel_recommendation_actions import callback as zhanel_rec_callback
+            feedback(zhanel_rec_callback(db,queue,cid,uid,action,tid,chair,emit,nums[1] if len(nums)>1 else None))
+            return True
         if action=='recimport':
             if not chair: feedback('Только администратор или ведущий.')
             else:
