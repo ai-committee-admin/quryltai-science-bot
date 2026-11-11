@@ -67,16 +67,23 @@ def run_cv_once(path,admins,connect,queue,download,extract,generate):
         pid=db.execute('INSERT INTO expert_profiles(name,role,topics,experience,education,source_file,source_name) VALUES(?,?,?,?,?,?,?)',tuple(values[k] for k in FIELDS)+(job['file_id'],job['name'])).lastrowid
         db.execute("UPDATE cv_jobs SET status='done',profile=? WHERE id=?",(pid,job['id']))
         p=db.execute('SELECT * FROM expert_profiles WHERE id=?',(pid,)).fetchone()
-        send(db,queue,job['uid'],profile_text(p,True)+'\n\n'+warning+'\n\nПроверьте черновик. Затем в группе ответьте на сообщение самого эксперта командой /profile_link. Исправление: /profile_edit НОМЕР поле | Значение. Публикации пока нет.')
+        send(db,queue,job['uid'],profile_text(p,True)+'\n\n'+warning+'\n\nПроверьте черновик. Затем ответьте в группе на сообщение эксперта командой /profile_link. После привязки в личном чате появится кнопка «Утвердить эксперта». Исправление: /profile_edit НОМЕР поле | Значение.')
     return True
 
 
 def public_card(db,queue,p):
     from group_tasks import emit
-    label='Подтверждён экспертом' if p['confirmed'] else 'Профиль по резюме, привязан администратором'
+    label='Утверждён администратором' if p['published'] else 'Ожидает проверки администратора'
     text=f'{p["name"]}\n{p["role"]}\nТемы: {p["topics"]}\n{label}.'
-    buttons=[[('Всё верно',f'epg:ok:{p["id"]}:{p["revision"]}'),('Нужно исправить',f'epg:fix:{p["id"]}:{p["revision"]}')]]
-    emit(db,queue,p['chat'],text,buttons)
+    emit(db,queue,p['chat'],text)
+
+
+def admin_review(db,queue,uid,p):
+    """Private approval prompt; no profile data written to a public group before approval."""
+    send(db,queue,uid,profile_text(p,True)+
+         '\n\nПроверьте ФИО, должность и темы. После утверждения профиль станет доступен в поиске и подборе.',
+         [[('✅ Утвердить эксперта',f'epa:approve:{p["id"]}:{p["revision"]}')],
+          [('✏️ Как исправить',f'epa:edit:{p["id"]}:{p["revision"]}')]])
 
 
 def choices(db,queue,uid,link,offset=0):
@@ -130,7 +137,7 @@ def handle_application_link(db,queue,uid,data):
     if db.execute('SELECT 1 FROM expert_profiles WHERE target=? AND chat=?',(link['target'],link['chat'])).fetchone():
         send(db,queue,uid,'У этого Telegram-аккаунта уже есть профиль в данной группе.');return True
     if action=='pick':
-        send(db,queue,uid,f'Проверьте совпадение вручную!\nTelegram: {link["name"]}, ID {link["target"]}\nЗаявка: {p["name"]}\nОрганизация: {p["organization"] or "не указана"}\nТемы: {(p["topics"] or "не указаны")[:500]}\n\nПривязать эту заявку? После подтверждения будет создан или использован профиль; участник сможет подтвердить его в группе.',[[('Подтвердить привязку',f'ela:bind:{lid}:{aid}')],[('Не привязывать',f'ela:cancel:{lid}:{aid}')]])
+        send(db,queue,uid,f'Проверьте совпадение вручную!\nTelegram: {link["name"]}, ID {link["target"]}\nЗаявка: {p["name"]}\nОрганизация: {p["organization"] or "не указана"}\nТемы: {(p["topics"] or "не указаны")[:500]}\n\nПривязать эту заявку? Будет создан или использован профиль. Затем администратор проверит и утвердит карточку.',[[('Подтвердить привязку',f'ela:bind:{lid}:{aid}')],[('Не привязывать',f'ela:cancel:{lid}:{aid}')]])
         return True
     # Serialize confirmation across concurrent webhook updates.
     if not existing:
@@ -139,10 +146,10 @@ def handle_application_link(db,queue,uid,data):
             p['name'][:1500],role[:1500],(p['topics'] or 'Не указано')[:1500],(p['experience'] or 'Не указано')[:1500],(p['education'] or 'Не указано')[:1500])).lastrowid
         db.execute('UPDATE expert_applications SET promoted_profile=? WHERE application_id=? AND promoted_profile IS NULL',(pid,aid))
     else:pid=existing['id']
-    db.execute('UPDATE expert_profiles SET target=?,chat=?,published=1,confirmed=0 WHERE id=? AND target IS NULL',(link['target'],link['chat'],pid))
+    db.execute('UPDATE expert_profiles SET target=?,chat=?,published=0,confirmed=0 WHERE id=? AND target IS NULL',(link['target'],link['chat'],pid))
     db.execute('UPDATE profile_links SET used=1 WHERE id=? AND used=0',(lid,))
-    public_card(db,queue,db.execute('SELECT * FROM expert_profiles WHERE id=?',(pid,)).fetchone())
-    send(db,queue,uid,f'Готово. Заявка {aid} привязана к Telegram ID {link["target"]} как профиль №{pid}. Эксперт должен подтвердить карточку.')
+    admin_review(db,queue,uid,db.execute('SELECT * FROM expert_profiles WHERE id=?',(pid,)).fetchone())
+    send(db,queue,uid,f'Заявка {aid} привязана к Telegram как профиль №{pid}. Проверьте карточку выше и нажмите «Утвердить эксперта».')
     return True
 
 def handle_easy(db,admins,update,queue):
@@ -169,24 +176,49 @@ def handle_easy(db,admins,update,queue):
                 choices(db,queue,uid,db.execute('SELECT * FROM profile_links WHERE id=?',(lid,)).fetchone())
             emit(db,queue,cid,'Выбор профиля — в личке.');return True
         if cb and cb.get('data','').startswith('epg:'):
-            queue(db,'answerCallbackQuery',{'callback_query_id':cb['id'],'text':'Проверяю…'})
-            match=re.fullmatch(r'epg:(ok|fix):(\d+):(\d+)',cb['data'])
-            if not match:return True
-            action,pid,rev=match.groups()
-            p=db.execute('SELECT * FROM expert_profiles WHERE id=? AND target=? AND chat=?',(pid,uid,cid)).fetchone()
-            if not p or p['revision']!=int(rev) or not (p['published'] or p['confirmed']):return True
-            if action=='ok':
-                db.execute('UPDATE expert_profiles SET confirmed=1,updated=CURRENT_TIMESTAMP WHERE id=?',(pid,))
-                from group_tasks import emit
-                emit(db,queue,cid,p['name']+': профиль подтверждён.')
-            else:
-                db.execute('UPDATE expert_profiles SET confirmed=0,published=0,revision=revision+1 WHERE id=?',(pid,))
-                from group_tasks import emit
-                emit(db,queue,cid,'Карточка скрыта из списка и подбора. Напишите администратору, что нужно исправить; ваши кейсы доступны как прежде.')
-                for admin in admins:send(db,queue,admin,f'{p["name"]} просит исправить профиль №{pid}. Уточните замечания и используйте /profile_edit. После исправления ответьте на сообщение эксперта командой /profile_link.')
+            queue(db,'answerCallbackQuery',{'callback_query_id':cb['id'],'text':'Карточки теперь утверждает администратор.'})
             return True
         return False
     if kind!='private' or cid!=uid:return False
+    if not cb and cmd=='/profile_approve':
+        if uid not in admins:
+            send(db,queue,uid,'Доступ только администратору.');return True
+        match=re.fullmatch(r'/profile_approve(?:@\w+)?\s+(\d+)',text)
+        if not match:
+            send(db,queue,uid,'Использование: /profile_approve 3');return True
+        pid=int(match.group(1))
+        p=db.execute('SELECT * FROM expert_profiles WHERE id=?',(pid,)).fetchone()
+        if not p or p['target'] is None or p['chat'] is None:
+            send(db,queue,uid,'Профиль не найден или Telegram ещё не привязан.');return True
+        enabled=db.execute('SELECT enabled FROM council_groups WHERE chat=?',(p['chat'],)).fetchone()
+        if not enabled or not enabled[0]:
+            send(db,queue,uid,'Группа не подключена.');return True
+        admin_review(db,queue,uid,p)
+        return True
+    if cb and cb.get('data','').startswith('epa:'):
+        queue(db,'answerCallbackQuery',{'callback_query_id':cb['id'],'text':'Проверяю карточку…'})
+        if uid not in admins:return True
+        match=re.fullmatch(r'epa:(approve|edit):(\d+):(\d+)',cb['data'])
+        if not match:return True
+        action,pid,rev=match.groups()
+        p=db.execute('SELECT * FROM expert_profiles WHERE id=?',(pid,)).fetchone()
+        if not p or p['revision']!=int(rev):
+            send(db,queue,uid,'Карточка изменилась. Запросите /profile_approve НОМЕР повторно.');return True
+        if p['target'] is None or p['chat'] is None:
+            send(db,queue,uid,'Сначала привяжите Telegram-аккаунт.');return True
+        enabled=db.execute('SELECT enabled FROM council_groups WHERE chat=?',(p['chat'],)).fetchone()
+        if not enabled or not enabled[0]:
+            send(db,queue,uid,'Группа отключена.');return True
+        if action=='edit':
+            send(db,queue,uid,f'Исправьте поле: /profile_edit {pid} role | Новая должность\nМожно изменить name, role, topics, experience, education. Затем снова /profile_approve {pid}.')
+            return True
+        if p['published']:
+            send(db,queue,uid,'Профиль уже утверждён администратором и доступен для подбора.');return True
+        result=db.execute('UPDATE expert_profiles SET published=1,confirmed=0,updated=CURRENT_TIMESTAMP WHERE id=? AND revision=? AND target IS NOT NULL AND chat=? AND published=0',(pid,int(rev),p['chat']))
+        if result.rowcount!=1:
+            send(db,queue,uid,'Статус изменился. Откройте карточку заново.');return True
+        send(db,queue,uid,f'Профиль №{pid} ({p["name"]}) утверждён. Он доступен в поиске и подборе экспертов. Подтверждение учёного не требуется.')
+        return True
     if not cb and cmd=='/profile_find':
         if uid not in admins:send(db,queue,uid,'Доступ только администратору.');return True
         find_across_sources(db,queue,uid,text[len(cmd):]);return True
@@ -208,7 +240,7 @@ def handle_easy(db,admins,update,queue):
             p=db.execute('SELECT * FROM expert_profiles WHERE id=? AND revision=?',(a,b)).fetchone()
             group=db.execute('SELECT enabled FROM council_groups WHERE chat=?',(p['chat'],)).fetchone() if p else None
             if p and p['target'] and group and group[0]:
-                db.execute('UPDATE expert_profiles SET published=1 WHERE id=?',(a,));public_card(db,queue,p)
+                admin_review(db,queue,uid,p)
             return True
         link=db.execute('SELECT * FROM profile_links WHERE id=? AND admin=? AND used=0',(a,uid)).fetchone()
         group=db.execute('SELECT enabled FROM council_groups WHERE chat=?',(link['chat'],)).fetchone() if link else None
@@ -221,9 +253,9 @@ def handle_easy(db,admins,update,queue):
         elif action=='bind':
             if rev is None or p['revision']!=int(rev):send(db,queue,uid,'Профиль изменился. Выберите его заново.');return True
             if db.execute('SELECT 1 FROM expert_profiles WHERE target=? AND chat=?',(link['target'],link['chat'])).fetchone():send(db,queue,uid,'У этого аккаунта уже есть профиль в данном чате.');return True
-            db.execute('UPDATE expert_profiles SET target=?,chat=?,published=1,confirmed=0 WHERE id=?',(link['target'],link['chat'],b))
+            db.execute('UPDATE expert_profiles SET target=?,chat=?,published=0,confirmed=0 WHERE id=?',(link['target'],link['chat'],b))
             db.execute('UPDATE profile_links SET used=1 WHERE id=?',(a,))
             p=db.execute('SELECT * FROM expert_profiles WHERE id=?',(b,)).fetchone()
-            public_card(db,queue,p);send(db,queue,uid,'Профиль привязан. Эксперту не нужны команды: он может подтвердить карточку прямо в группе.')
+            admin_review(db,queue,uid,p);send(db,queue,uid,'Telegram привязан. Проверьте карточку и утвердите её сами — действий эксперта не требуется.')
         return True
     return False
