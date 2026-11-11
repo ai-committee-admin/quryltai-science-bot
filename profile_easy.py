@@ -83,8 +83,67 @@ def choices(db,queue,uid,link,offset=0):
     rows=db.execute('SELECT id,name FROM expert_profiles WHERE target IS NULL ORDER BY id DESC LIMIT 11 OFFSET ?',(offset,)).fetchall()
     buttons=[[(f'№{p["id"]} · {p["name"][:45]}',f'epl:pick:{link["id"]}:{p["id"]}')] for p in rows[:10]]
     if len(rows)>10:buttons.append([('Далее',f'epl:list:{link["id"]}:{offset+10}')])
-    send(db,queue,uid,f'Выберите профиль для {link["name"]} (Telegram ID {link["target"]}), чат {link["chat"]}. Никакие номера вводить не нужно.' if rows else 'Нет непривязанных профилей. Отправьте резюме сюда как PDF/Word и повторите /profile_link в группе.',buttons)
+    send(db,queue,uid,f'Выберите профиль для {link["name"]} (Telegram ID {link["target"]}), чат {link["chat"]}.\nЕсли нужного человека нет в списке, отправьте здесь /profile_find ФАМИЛИЯ — поиск по резюме и реестру заявок.' ,buttons)
 
+
+
+def find_across_sources(db,queue,uid,query):
+    """Search existing CV profiles and applicant registry for an administrator's pending reply-link."""
+    link=db.execute('SELECT * FROM profile_links WHERE admin=? AND used=0 ORDER BY id DESC LIMIT 1',(uid,)).fetchone()
+    if not link:
+        send(db,queue,uid,'Сначала ответьте на сообщение эксперта в группе командой /profile_link.');return
+    if not db.execute('SELECT 1 FROM council_groups WHERE chat=? AND enabled=1',(link['chat'],)).fetchone():
+        send(db,queue,uid,'Группа отключена. Повторите привязку в действующей группе.');return
+    query=query.strip()
+    if len(query)<3 or len(query)>100 or not re.search(r'\w',query):
+        send(db,queue,uid,'Укажите фамилию: /profile_find Баксултанов');return
+    escaped=query.replace('%','').replace('_','')
+    pattern='%'+escaped+'%'
+    profiles=db.execute("SELECT id,name FROM expert_profiles WHERE target IS NULL AND name LIKE ? ORDER BY id DESC LIMIT 8",(pattern,)).fetchall()
+    candidates=db.execute("SELECT application_id,name,promoted_profile FROM expert_applications WHERE name LIKE ? ORDER BY name LIMIT 8",(pattern,)).fetchall()
+    buttons=[]
+    for p in profiles:
+        buttons.append([(f'Резюме №{p["id"]} · {p["name"][:34]}',f'epl:pick:{link["id"]}:{p["id"]}')])
+    for p in candidates:
+        if p['promoted_profile']:
+            existing=db.execute('SELECT target FROM expert_profiles WHERE id=?',(p['promoted_profile'],)).fetchone()
+            if existing and existing['target'] is not None:continue
+        buttons.append([(f'Заявка · {p["name"][:34]}',f'ela:pick:{link["id"]}:{p["application_id"]}')])
+    if not buttons:
+        send(db,queue,uid,'По фамилии совпадений не найдено. Проверьте написание или загрузите резюме.');return
+    send(db,queue,uid,f'Найдены записи для «{query}». Выберите ФИО только после проверки личности. Telegram: {link["name"]} (ID {link["target"]}).',buttons[:12])
+
+
+def handle_application_link(db,queue,uid,data):
+    match=re.fullmatch(r'ela:(pick|bind):(\d+):(EXP-\d{4}-\d{6})',data)
+    if not match:return True
+    action,lid,aid=match.groups()
+    link=db.execute('SELECT * FROM profile_links WHERE id=? AND admin=? AND used=0',(lid,uid)).fetchone()
+    if not link or not db.execute('SELECT 1 FROM council_groups WHERE chat=? AND enabled=1',(link['chat'],)).fetchone():
+        send(db,queue,uid,'Привязка устарела. Повторите /profile_link.');return True
+    p=db.execute('SELECT * FROM expert_applications WHERE application_id=?',(aid,)).fetchone()
+    if not p:
+        send(db,queue,uid,'Заявка не найдена.');return True
+    existing=db.execute('SELECT * FROM expert_profiles WHERE id=?',(p['promoted_profile'],)).fetchone() if p['promoted_profile'] else None
+    if existing and existing['target'] is not None:
+        send(db,queue,uid,'Этот профиль уже связан с Telegram. Автоматическая перепривязка запрещена.');return True
+    if db.execute('SELECT 1 FROM expert_profiles WHERE target=? AND chat=?',(link['target'],link['chat'])).fetchone():
+        send(db,queue,uid,'У этого Telegram-аккаунта уже есть профиль в данной группе.');return True
+    if action=='pick':
+        send(db,queue,uid,f'Проверьте совпадение вручную!\nTelegram: {link["name"]}, ID {link["target"]}\nЗаявка: {p["name"]}\nОрганизация: {p["organization"] or "не указана"}\nТемы: {(p["topics"] or "не указаны")[:500]}\n\nПривязать эту заявку? После подтверждения будет создан или использован профиль; участник сможет подтвердить его в группе.',[[('Подтвердить привязку',f'ela:bind:{lid}:{aid}')],[('Не привязывать',f'ela:cancel:{lid}:{aid}')]])
+        return True
+    # Serialize confirmation across concurrent webhook updates.
+    if not existing:
+        role=' · '.join(x for x in (p['organization'],p['position']) if x) or 'Не указано'
+        pid=db.execute('INSERT INTO expert_profiles(name,role,topics,experience,education) VALUES(?,?,?,?,?)',(
+            p['name'][:1500],role[:1500],(p['topics'] or 'Не указано')[:1500],(p['experience'] or 'Не указано')[:1500],(p['education'] or 'Не указано')[:1500])).lastrowid
+        db.execute('UPDATE expert_applications SET promoted_profile=? WHERE application_id=? AND promoted_profile IS NULL',(pid,aid))
+    else:pid=existing['id']
+    db.execute('UPDATE expert_profiles SET target=?,chat=?,published=1,confirmed=0 WHERE id=? AND target IS NULL',(link['target'],link['chat'],pid))
+    db.execute('UPDATE profile_links SET used=1 WHERE id=? AND used=0',(lid,))
+    public_card(db,queue,db.execute('SELECT * FROM expert_profiles WHERE id=?',(pid,)).fetchone())
+    send(db,queue,uid,f'Готово. Заявка {aid} привязана к Telegram ID {link["target"]} как профиль №{pid}. Эксперт должен подтвердить карточку.')
+    return True
 
 def handle_easy(db,admins,update,queue):
     cb=update.get('callback_query');m=(cb or {}).get('message') if cb else update.get('message');m=m or {};chat=m.get('chat') or {}
@@ -128,6 +187,17 @@ def handle_easy(db,admins,update,queue):
             return True
         return False
     if kind!='private' or cid!=uid:return False
+    if not cb and cmd=='/profile_find':
+        if uid not in admins:send(db,queue,uid,'Доступ только администратору.');return True
+        find_across_sources(db,queue,uid,text[len(cmd):]);return True
+    if cb and cb.get('data','').startswith('ela:'):
+        queue(db,'answerCallbackQuery',{'callback_query_id':cb['id'],'text':'Проверяю…'})
+        if uid not in admins:return True
+        if cb['data'].startswith('ela:cancel:'):
+            cancel=re.fullmatch(r'ela:cancel:(\d+):EXP-\d{4}-\d{6}',cb['data'])
+            if cancel:db.execute('UPDATE profile_links SET used=1 WHERE id=? AND admin=?',(int(cancel.group(1)),uid))
+            send(db,queue,uid,'Привязка отменена. Для нового выбора повторите /profile_link ответом на сообщение эксперта.');return True
+        return handle_application_link(db,queue,uid,cb['data'])
     if cb and cb.get('data','').startswith('epl:'):
         queue(db,'answerCallbackQuery',{'callback_query_id':cb['id'],'text':'Проверяю…'})
         if uid not in admins:return True
