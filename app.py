@@ -9,6 +9,7 @@ import os
 import re
 import sqlite3
 import threading
+import traceback
 import time
 import urllib.error
 import urllib.request
@@ -627,8 +628,23 @@ def handler_factory(path, secret, admins):
             try:
                 process(path, admins, update)
                 self.reply(200, 'ok')
-            except Exception:
-                print('Update processing failed; Telegram may retry.', flush=True)
+            except Exception as exc:
+                # Diagnostic logging deliberately omits update bodies, credentials,
+                # exception messages and local variables: these may contain private data.
+                frames = traceback.extract_tb(exc.__traceback__)
+                locations = ' -> '.join(
+                    f'{os.path.basename(frame.filename)}:{frame.lineno}:{frame.name}'
+                    for frame in frames[-12:]
+                )
+                update_kind = 'callback_query' if 'callback_query' in update else (
+                    'message' if 'message' in update else 'other'
+                )
+                print(
+                    f'Update processing failed: update_id={update["update_id"]} '
+                    f'kind={update_kind} exception={type(exc).__name__} '
+                    f'location={locations}; Telegram may retry.',
+                    flush=True,
+                )
                 self.reply(500, 'Retry later')
     return Handler
 
