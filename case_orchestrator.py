@@ -55,11 +55,17 @@ def prepare(db,queue,chat,uid,raw,emit):
                        VALUES(?,?,?,?,?)''',(chat,uid,issue,now.isoformat(),(now+timedelta(hours=24)).isoformat())).lastrowid
     found=related(db,chat,issue)
     names=', '.join('№'+str(x['id']) for x in found) if found else 'близких записей пока не найдено'
-    n=len(candidates(db,issue))
-    text=(f'Предлагаю открыть кейс по проблеме:\n«{issue[:800]}»\n\n'
-          f'Проверка базы: {names}.\n'
-          f'Подбор по заявкам: {n} предварительных кандидата(ов) по тематике (не подтверждённые члены совета).\n\n'
-          'После создания я покажу, как организовать обсуждение, собрать мнения, подготовить заключение и поставить рекомендации на контроль. '
+    from expert_matching import find
+    approved,applicants=find(db,issue,chat=chat,limit=3)
+    def brief(items,is_profile):
+        return ', '.join((f'№{p["id"]} {p["name"]}' if is_profile else p['name']) for _,p,_ in items) or 'нет тематических совпадений'
+    titles=', '.join(f'№{x["id"]}: {x["body"][:65]}' for x in found) if found else 'похожих кейсов не найдено'
+    text=(f'Предлагаю открыть кейс по проблеме:\n«{issue[:700]}»\n\n'
+          f'Похожие кейсы: {titles}.\n'
+          f'Утверждённые эксперты: {brief(approved,True)}.\n'
+          f'Кандидаты из заявок (не утверждены): {brief(applicants,False)}.\n'
+          'Подбор предварительный, без независимой проверки квалификации. '
+          'После создания я предложу вопросы, сбор мнений и подготовку заключения. '
           'Никого автоматически не приглашаю.\n\nСоздать кейс?')
     emit(db,queue,chat,text,[[('Создать кейс',f'g:plancreate:{pid}'),('Отмена',f'g:plancancel:{pid}')]])
     return True

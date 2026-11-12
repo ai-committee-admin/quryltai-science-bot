@@ -70,21 +70,16 @@ def clean_topic(s):
 
 
 def candidate_search(db,queue,chat,uid,raw,emit):
-    from expert_registry import rank
+    from expert_matching import find, format_results
     topic=clean_topic(raw)
     if len(topic)<3:
         emit(db,queue,chat,'По какой научной теме подобрать экспертов? Например: «Жанель, найди экспертов по энергетике».')
         return
-    matches=rank(db,topic,8)
-    if not matches:
-        remember(db,chat,uid,'experts',topic,'')
-        emit(db,queue,chat,'В реестре не нашлось прямых совпадений по теме «'+topic[:100]+'». Уточни направление или используй более общий термин.')
-        return
-    ids=','.join(p['application_id'] for _,p,_ in matches)
+    approved,candidates=find(db,topic,chat=chat,limit=5)
+    # Keep the existing follow-up sequence for candidates; never imply approval.
+    ids=','.join(p['application_id'] for _,p,_ in candidates)
     remember(db,chat,uid,'experts',topic,ids)
-    lines=[f'{i}. {p["name"]} — {p["topics"][:130] or "специализация не указана"}' for i,(_,p,_) in enumerate(matches[:5],1)]
-    emit(db,queue,chat,f'По теме «{topic}» нашла {len(matches)} кандидатов (данные заявок, квалификация не подтверждена):\n'+'\n'.join(lines)+'\n\nМогу показать первых трёх или подготовить приглашения для проверки администратором. Контакты в группе не публикую.')
-
+    emit(db,queue,chat,format_results(topic,approved,candidates))
 
 def selection_reply(db,queue,chat,uid,raw,emit):
     state=load(db,chat,uid)

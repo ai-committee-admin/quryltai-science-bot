@@ -198,18 +198,8 @@ def group_profiles(db,queue,cid,uid,text):
         tid=parts[1] if len(parts)==2 and parts[1].isdigit() else None
         task=db.execute('SELECT * FROM council_tasks WHERE id=? AND chat=?',(tid,cid)).fetchone()
         if not task:emit(db,queue,cid,'Формат: /recommend НОМЕР_КЕЙСА');return True
-        matches_by_profile=[]
-        for p in db.execute('SELECT * FROM expert_profiles WHERE chat=? AND (confirmed=1 OR published=1) ORDER BY name',(cid,)).fetchall():
-            exact,related=topic_matches(p['topics'],task['body'])
-            if not (exact or related):continue
-            score=(bool(exact),len(exact),len(related))
-            reasons=[]
-            if exact:reasons.append('совпадают темы: '+', '.join(exact[:3]))
-            if related:reasons.append('совпадение ключевых слов: '+', '.join(related[:3]))
-            status='утверждён администратором' if p['published'] else 'не утверждён'
-            matches_by_profile.append((score,f'№{p["id"]} · {p["name"]} — {"; ".join(reasons)} ({status})'))
-        matches_by_profile.sort(key=lambda item:item[0],reverse=True)
-        lines=[item[1] for item in matches_by_profile[:5]]
-        if len(matches_by_profile)>5:lines.append(f'Ещё профилей с совпадениями: {len(matches_by_profile)-5}. Для просмотра всех — /experts.')
-        emit(db,queue,cid,f'Подбор по теме кейса №{tid}:\n'+('\n'.join(lines) if lines else 'Совпадений с темами опубликованных профилей нет.')+'\nПодбор ориентировочный: только по указанным темам, без проверки квалификации. Никто не назначен автоматически.');return True
+        from expert_matching import find, format_results
+        approved,candidates=find(db,task['body'],chat=cid)
+        emit(db,queue,cid,f'Кейс №{tid}\n'+format_results(task['body'],approved,candidates))
+        return True
     return False

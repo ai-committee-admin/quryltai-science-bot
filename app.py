@@ -168,6 +168,21 @@ def process(path, admins, update):
         if draft and draft['external_id'] and uid not in admins and cmd != '/cancel':
             say(db, uid, 'Доступ к импорту отозван. /cancel — удалить свой черновик.')
             return
+        # Natural-language expert discovery in administrator DM. Read-only; never
+        # intercept submitted proposals/drafts, documents, or non-admin messages.
+        if uid in admins and not draft and text and not cmd.startswith('/') and not m.get('document'):
+            from zhanel_dialogue import expert_request, clean_topic
+            prompt = re.sub(r'^\s*(?:жанель|жәнел|жанел|zhanel|janel)[\s,!:;.—-]*','',text,flags=re.I)
+            if expert_request(prompt):
+                from expert_matching import find,format_results
+                topic=clean_topic(prompt)
+                topic=re.split(r'\.\s*(?:покажи|объясни|укажи)\b',topic, maxsplit=1,flags=re.I)[0].strip()
+                if len(topic)<4:
+                    say(db,uid,'Уточните научную специализацию: «Подбери экспертов по управлению НИОКР».')
+                else:
+                    approved,applicants=find(db,topic,chat=None)
+                    say(db,uid,format_results(topic,approved,applicants))
+                return
         if cmd in ('/start', '/help'):
             say(db, uid, 'Ғылым — помощник экспертного совета по науке.\n'
                 'Отправьте PDF или Word в личный чат: бот предложит выбрать «Анализ документа», «Предложение» или «Резюме». Анализ документа и создание профиля из резюме доступны администратору. Ваш Telegram ID, имя, текст и ссылки на файлы будут сохранены и доступны администратору совета. '
