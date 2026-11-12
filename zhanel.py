@@ -92,8 +92,8 @@ def handle(db,queue,chat,uid,message,admins):
         return True
     raw=text[match.end():].strip()
     # v4.4 workflow: explicit plan first; no records or outreach until confirmation.
-    from case_orchestrator import START as WORKFLOW_START, PROGRESS as WORKFLOW_PROGRESS
-    if WORKFLOW_START.search(raw):
+    from case_orchestrator import START as WORKFLOW_START, PROGRESS as WORKFLOW_PROGRESS, NEGATED_CREATE
+    if WORKFLOW_START.search(raw) and not NEGATED_CREATE.search(raw):
         from case_orchestrator import prepare
         return prepare(db,queue,chat,uid,raw,emit)
     if WORKFLOW_PROGRESS.search(raw):
@@ -127,7 +127,7 @@ def handle(db,queue,chat,uid,message,admins):
         ai=classify(raw) if action=='unknown' or len(raw.split())>8 else None
     except Exception:
         ai=None
-    if ai and ai['action']!='unknown' and action not in ('dated_cases','open_cases','latest_case','recent_discussions','opinions','overdue'):
+    if ai and ai['action']!='unknown' and action not in ('create','dated_cases','open_cases','latest_case','recent_discussions','opinions','overdue'):
         action=ai['action']
     # Explicit sensitive local verbs remain sensitive even if model misclassifies.
     local_action=_intent(raw)
@@ -192,16 +192,13 @@ def handle(db,queue,chat,uid,message,admins):
             emit(db,queue,chat,request(db,chat,uid,query[:500]))
         return True
     if action=='create':
-        detail=(ai.get('topic') if ai and ai['action']=='create' else '') or re.sub(r'^.*?\bкейс\b\s*[:№.\-]?\s*','',raw,flags=re.I).strip()
-        detail=re.sub(r'^\b(?:по|о|об|на тему)\b\s*','',detail,flags=re.I).strip()
-        if len(detail)<12:
-            emit(db,queue,chat,'Укажи тему и проблему: «Жанель, создай кейс: задержки грантового финансирования и их влияние на исследования».')
-            return True
-        task_id=db.execute('INSERT INTO council_tasks(chat,creator,body) VALUES(?,?,?)',(chat,uid,detail[:5000])).lastrowid
-        task=db.execute('SELECT * FROM council_tasks WHERE chat=? AND id=?',(chat,task_id)).fetchone()
-        _remember(db,chat,uid,task_id)
-        task_card(db,queue,task)
-        return True
+        # One safe workflow for explicit requests and AI-classified creation.
+        # Never resolve an old case from context for a creation request.
+        from case_orchestrator import prepare
+        topic=(ai.get('topic') if ai and ai['action']=='create' else '') or raw
+        if topic != raw:
+            topic='создай кейс: '+topic
+        return prepare(db,queue,chat,uid,topic,emit)
     target_number=None
     if pending and action==pending['action'] and re.fullmatch(r'(?:кейс\s*)?(?:№\s*)?\d{1,10}',raw.strip(),re.I):
         target_number=int(re.search(r'\d+',raw).group())
